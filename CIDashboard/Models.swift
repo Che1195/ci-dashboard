@@ -113,7 +113,7 @@ struct JobInfo: Identifiable, Sendable, Equatable {
 }
 
 enum RunnerState: String, Sendable, Equatable {
-    case holding, busy, idle, offline, notRegistered
+    case holding, busy, idle, offline, disabled, notRegistered
 
     var label: String {
         switch self {
@@ -121,6 +121,7 @@ enum RunnerState: String, Sendable, Equatable {
         case .busy: "Busy"
         case .idle: "Idle"
         case .offline: "Offline"
+        case .disabled: "Disabled"
         case .notRegistered: "Not registered"
         }
     }

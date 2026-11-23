@@ -34,7 +34,10 @@ Click the menu-bar dot, then the gear:
 - **Runner logs (optional):** per runner, a log file on this Mac or a host and path read with `ssh <host> tail`
   (non-interactive; set up key-based SSH first). Two patterns decide *holding*: the runner is holding when the latest
   line matching either pattern matches **Holding when**.
-- **General:** refresh every 15, 30 (default) or 60 seconds; the path to `gh` if it isn't found automatically.
+- **General:** launch at login; notify when something goes red (on by default); refresh every 15, 30 (default) or
+  60 seconds; the path to `gh` if it isn't found automatically.
+- **A runner you parked on purpose:** right-click its row and mark it disabled, so it shows grey *Disabled* instead
+  of orange *Offline*.
 
 Settings stay in this Mac's preferences (`io.github.che1195.CIDashboard`), never in the repo.
 

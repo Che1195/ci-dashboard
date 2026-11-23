@@ -21,10 +21,12 @@ enum StatusRules {
         return custom.isEmpty ? "self-hosted" : custom.joined(separator: " + ")
     }
 
-    static func runnerState(status: String, busy: Bool, holding: Bool?) -> RunnerState {
+    /// `disabled`: the user parked this runner on purpose, so being offline is expected. An online one still shows
+    /// what it is doing, and a hold still wins.
+    static func runnerState(status: String, busy: Bool, holding: Bool?, disabled: Bool = false) -> RunnerState {
         if holding == true { return .holding }
         if status == "online" { return busy ? .busy : .idle }
-        return .offline
+        return disabled ? .disabled : .offline
     }
 
     /// Holding = the most recent line matching either pattern matches the hold pattern.
@@ -167,7 +169,8 @@ enum StatusRules {
         snapshots: [RepoSnapshot],
         logs: [String: LogStatus],
         seen: [SeenRunner],
-        now: Date
+        now: Date,
+        disabled: Set<String> = []
     ) -> Dashboard {
         var dash = Dashboard()
         dash.repoErrors = snapshots.compactMap(\.error)
@@ -212,7 +215,8 @@ enum StatusRules {
                 let log = logs[r.name]
                 rows.append(RunnerRow(
                     repo: snap.repo, name: r.name, os: r.os, labels: r.labels.map(\.name),
-                    state: runnerState(status: r.status, busy: r.busy, holding: log?.holding),
+                    state: runnerState(status: r.status, busy: r.busy, holding: log?.holding,
+                                       disabled: disabled.contains(r.name.lowercased())),
                     currentJob: running.first { $0.runnerName == r.name }, log: log, lastSeen: now))
             }
             // With an incomplete list, only remembered runners whose log says they're holding are shown, so that alert

@@ -48,7 +48,8 @@ local file or runs `ssh <host> tail -n <N> <path>`. A unit test checks that ever
 | Holding | log source says holding (wins over everything). Only whole lines are matched: a last line the writer hasn't finished (no newline yet) is left for the next read, and everything matched in a local file comes from one read of it; if the file shrinks while it is being read (truncated or rewritten), that read counts as failed. A hold stays until the log shows a clear line: a failed or timed-out read, or a marker scrolled out of the last 200 lines, keeps it, with a note saying when it was last confirmed. Editing settings can't end or start a hold by itself: a read counts only for a log source that is still exactly as it was when the read started (runner name, host, path, both patterns), any other runner's hold stays as it was, and a hold is dropped for having no log source only once no row names its runner. Holds are saved, so a relaunch keeps them and shows them at once, before the first refresh; logs are read even when `gh` is missing or GitHub is unreachable |
 | Busy | `status == online && busy` |
 | Idle | `status == online && !busy` |
-| Offline | `status == offline` |
+| Offline | `status == offline` (orange) |
+| Disabled | offline, and marked *disabled on purpose* (right-click the row); grey. Online or holding wins over it. Marks are saved by runner name, ignoring case |
 | Not registered | seen in the last 24 h, absent now |
 
 Overall (menu-bar icon):
@@ -69,8 +70,14 @@ Remembered runners show as *not registered* only when the runner list loaded in 
 time. About 7 + N calls per repo per refresh; at 30 s with one busy repo, roughly 1,000 calls/hour of the 5,000-hour limit.
 Rate-limit remaining is shown in the footer.
 
-## Exclusions (v1)
-Notifications, history charts, GitHub-hosted runner detail, organisation-level runners, any write action.
+## Notifications (v1.1)
+A runner holding, jobs no online runner can take (per label set), and a job queued over 10 min each notify once
+when they start. A hold or stranded label set notifies again when it clears; a drained queue doesn't. While GitHub
+can't be read, GitHub-based problems keep their state (no false "cleared"); holds follow the logs, which are still
+read. Settings → General has the switch (on by default) and **Launch at login** (`SMAppService`).
+
+## Exclusions
+History charts, GitHub-hosted runner detail, organisation-level runners, any write action.
 
 ## Accepted limits (closing audit, 2026-11-23)
 These assume the setup the app is built for: your own Macs as runner hosts, and log paths and a `gh` you chose.
@@ -78,7 +85,7 @@ These assume the setup the app is built for: your own Macs as runner hosts, and 
   runs as it would for any ssh login; a Windows host's `cmd.exe` would not honour the POSIX quoting. If the log path
   is a named pipe, the remote `tail` can block after the local deadline kills `ssh`. Point log sources only at
   regular log files on hosts you control.
-- **Log-source edits apply on Save.** The editor works on a copy; patterns must be valid regular expressions to save.
+- **Log-source edits apply on Save.** The editor works on a copy; patterns must be valid regular expressions to save, and **Cleared when** can't be empty (a hold could never end). Unsaved edits survive switching rows and show " · not saved".
   `ssh` asks `tail` for 201 lines and keeps the last 200 whole ones (an unfinished last line is never matched).
 - **ssh sees only `HOME`, `USER`, `LOGNAME`, `SSH_AUTH_SOCK`, `TMPDIR`, `LANG` and a fixed `PATH`**, so no
   `SendEnv` setting can pass a token on.

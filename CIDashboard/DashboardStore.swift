@@ -9,10 +9,11 @@ final class DashboardStore {
             guard settings != oldValue else { return }
             SettingsStore.save(settings, defaults)
             if settings.repos != oldValue.repos || settings.logSources != oldValue.logSources
-                || settings.ghPath != oldValue.ghPath {
+                || settings.ghPath != oldValue.ghPath || settings.disabledRunners != oldValue.disabledRunners {
                 settingsGeneration += 1
                 Task { await refresh() }
             }
+            if settings.notify && !oldValue.notify { notifier.prepare() }
             if settings.refreshSeconds != oldValue.refreshSeconds || settings.hourlyDiscovery != oldValue.hourlyDiscovery {
                 startLoops()
             }
@@ -46,9 +47,16 @@ final class DashboardStore {
     /// Where settings, remembered runners and holds are kept (a test passes its own, never the app's).
     private let defaults: UserDefaults
 
-    init(commandRunner: CommandRunning = ProcessRunner(), defaults: UserDefaults = .standard) {
+    /// Problems already notified, by key, so each notifies once when it appears and once when it clears.
+    private var activeAlerts: [String: Alert] = [:]
+    private let notifier: Notifying
+    private static var underTests: Bool { ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil }
+
+    init(commandRunner: CommandRunning = ProcessRunner(), defaults: UserDefaults = .standard,
+         notifier: Notifying? = nil) {
         self.commandRunner = commandRunner
         self.defaults = defaults
+        self.notifier = notifier ?? (Self.underTests ? SilentNotifier() : UserNotifier())
         var loaded = SettingsStore.load(defaults)
         loaded.repos = AppSettings.uniqueRepos(loaded.repos)
         settings = loaded
@@ -58,7 +66,10 @@ final class DashboardStore {
         dashboard = StatusRules.restoredDashboard(
             holds: confirmedHolds, sources: loaded.logSources, repos: loaded.repos, seen: seen, now: Date())
         // The unit-test host launches the app; don't poll GitHub from tests.
-        if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil { startLoops() }
+        if !Self.underTests {
+            if settings.notify { self.notifier.prepare() }
+            startLoops()
+        }
     }
 
     /// The status now. Queue-age thresholds are re-checked against the clock, so a job crossing 3 or 10 minutes
@@ -163,7 +174,9 @@ final class DashboardStore {
             globalError = nil
         }
         updateSeen(snapshots, now: now)
-        dashboard = StatusRules.build(snapshots: snapshots, logs: sticky.logs, seen: seen, now: now)
+        dashboard = StatusRules.build(snapshots: snapshots, logs: sticky.logs, seen: seen, now: now,
+                                      disabled: Set(settings.disabledRunners))
+        notifyChanges(now: now)
         rateLimit = rateCore
         lastRefresh = now
     }
@@ -188,6 +201,34 @@ final class DashboardStore {
             return out.sorted { $0.0 < $1.0 }.map(\.1)
         }
     }
+
+    /// Notifies problems that appeared since the last refresh, and holds or stuck jobs that cleared. Tracked even
+    /// while notifications are off, so turning them on doesn't replay what is already red.
+    private func notifyChanges(now: Date) {
+        var current = AlertRules.alerts(dashboard, now: now)
+        // A global error (gh missing, GitHub unreachable) can hide GitHub-based problems without ending them: keep
+        // those as they were. Holds come from the logs, which are still read, so they follow the logs.
+        if globalError != nil {
+            let keys = Set(current.map(\.key))
+            current += activeAlerts.values.filter { !keys.contains($0.key) && !$0.key.hasPrefix("hold:") }
+                .sorted { $0.key < $1.key }
+        }
+        let (raised, cleared) = AlertRules.changes(previous: activeAlerts, current: current)
+        activeAlerts = Dictionary(current.map { ($0.key, $0) }, uniquingKeysWith: { a, _ in a })
+        guard settings.notify else { return }
+        for alert in raised { notifier.post(alert, cleared: false) }
+        for alert in cleared { notifier.post(alert, cleared: true) }
+    }
+
+    /// Marks a runner as parked on purpose, or not.
+    func setDisabled(_ name: String, _ on: Bool) {
+        let key = name.lowercased()
+        var list = settings.disabledRunners.filter { $0 != key }
+        if on { list.append(key); list.sort() }
+        settings.disabledRunners = list
+    }
+
+    func isDisabled(_ name: String) -> Bool { settings.disabledRunners.contains(name.lowercased()) }
 
     private func updateSeen(_ snapshots: [RepoSnapshot], now: Date) {
         // Keyed case-insensitively by repo (GitHub names are); the newest sighting wins.

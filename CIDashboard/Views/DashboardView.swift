@@ -149,7 +149,7 @@ struct DashboardView: View {
                 quiet("No self-hosted runners in these repos.")
             } else {
                 ForEach(store.dashboard.lanes) { lane in
-                    LaneCard(lane: lane, now: now, showRepo: multiRepo)
+                    LaneCard(lane: lane, now: now, showRepo: multiRepo, store: store)
                 }
             }
         }
@@ -306,6 +306,7 @@ struct LaneCard: View {
     let lane: Lane
     let now: Date
     let showRepo: Bool
+    let store: DashboardStore
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -320,6 +321,14 @@ struct LaneCard: View {
             if !lane.runners.isEmpty { Divider() }
             ForEach(lane.runners) { runner in
                 RunnerRowView(runner: runner, now: now)
+                    .contextMenu {
+                        // A local display setting only: nothing on GitHub or the runner changes.
+                        if store.isDisabled(runner.name) {
+                            Button("Show \(runner.name) as offline again") { store.setDisabled(runner.name, false) }
+                        } else {
+                            Button("Mark \(runner.name) as disabled on purpose") { store.setDisabled(runner.name, true) }
+                        }
+                    }
                 if runner.id != lane.runners.last?.id { Divider().padding(.leading, 34) }
             }
             if lane.runners.isEmpty {
@@ -354,6 +363,9 @@ struct RunnerRowView: View {
                 if let job = runner.currentJob {
                     Text([job.name, job.currentStep].compactMap { $0 }.joined(separator: " → "))
                         .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
+                if runner.state == .disabled {
+                    Text("Parked on purpose · right-click to change").font(.caption).foregroundStyle(.tertiary)
                 }
                 if runner.state == .notRegistered, let seen = runner.lastSeen {
                     Text("Between jobs or removed · last seen \(Format.duration(now.timeIntervalSince(seen))) ago")
@@ -391,7 +403,8 @@ struct StateDot: View {
         switch state {
         case .busy: .blue
         case .idle: .green
-        case .offline: .secondary
+        case .offline: .orange
+        case .disabled: Color(nsColor: .tertiaryLabelColor)
         case .holding: .red
         case .notRegistered: Color(nsColor: .tertiaryLabelColor)
         }
@@ -399,7 +412,7 @@ struct StateDot: View {
 
     var body: some View {
         Group {
-            if state == .notRegistered || state == .offline {
+            if state == .notRegistered || state == .offline || state == .disabled {
                 Circle().strokeBorder(Self.color(state), lineWidth: 1.5)
             } else {
                 Circle().fill(Self.color(state))

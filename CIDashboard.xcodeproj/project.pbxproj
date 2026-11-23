@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		0511E0F2EF2D0ABD47F4DBFD /* CommandRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 635321D5BDA04CC3BA8DB25E /* CommandRunner.swift */; };
+		57A20BA37E3DBDF6278067EF /* Alerts.swift in Sources */ = {isa = PBXBuildFile; fileRef = 34DE5EAD623E61DC856D385A /* Alerts.swift */; };
 		65053638A58BCC29B1473F59 /* StatusRules.swift in Sources */ = {isa = PBXBuildFile; fileRef = EB49A5A638209E70C4DC32D5 /* StatusRules.swift */; };
 		6EE8CC423E6A13824F5F6ED3 /* DashboardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DF2F9DFF182066AA9AF75C74 /* DashboardView.swift */; };
 		8DA0F93A045E2CBE11FFEB50 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC3E63CC81D581F59499E7AA /* SettingsView.swift */; };
@@ -34,6 +35,7 @@
 		0344A1559CFC592C319F1EA7 /* DashboardStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardStore.swift; sourceTree = "<group>"; };
 		13E7D6E9180CD57CCE55317A /* GitHubClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitHubClient.swift; sourceTree = "<group>"; };
 		2C462F0261641B3E937FBC7D /* CIDashboardApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CIDashboardApp.swift; sourceTree = "<group>"; };
+		34DE5EAD623E61DC856D385A /* Alerts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Alerts.swift; sourceTree = "<group>"; };
 		47A0EDE621184C10E9EA291C /* StatusRulesTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusRulesTests.swift; sourceTree = "<group>"; };
 		4CAABF692F75610D4444D70B /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		635321D5BDA04CC3BA8DB25E /* CommandRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CommandRunner.swift; sourceTree = "<group>"; };
@@ -51,6 +53,7 @@
 		3FE0932C15AF290364700928 /* CIDashboard */ = {
 			isa = PBXGroup;
 			children = (
+				34DE5EAD623E61DC856D385A /* Alerts.swift */,
 				2C462F0261641B3E937FBC7D /* CIDashboardApp.swift */,
 				635321D5BDA04CC3BA8DB25E /* CommandRunner.swift */,
 				0344A1559CFC592C319F1EA7 /* DashboardStore.swift */,
@@ -180,6 +183,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				57A20BA37E3DBDF6278067EF /* Alerts.swift in Sources */,
 				C8D5AB0FF2CB64ECFB209292 /* CIDashboardApp.swift in Sources */,
 				0511E0F2EF2D0ABD47F4DBFD /* CommandRunner.swift in Sources */,
 				DCFDDC9D4B4064A836280D34 /* DashboardStore.swift in Sources */,

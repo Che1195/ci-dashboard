@@ -982,7 +982,7 @@ final class StatusRulesTests: XCTestCase {
         source.holdPattern = "cleanup failed"; source.clearPattern = "[x"
         XCTAssertNotNil(source.saveProblem)
         source.clearPattern = ""
-        XCTAssertNil(source.saveProblem, "no clear pattern is allowed")
+        XCTAssertNotNil(source.saveProblem, "without a clear pattern a hold could never end")
     }
 
     func testDifferentlyEncodedPathsAreDifferentSources() {
@@ -990,6 +990,91 @@ final class StatusRulesTests: XCTestCase {
         var b = a; b.path = "/logs/cafe\u{301}.log"
         XCTAssertFalse(a.readsLike(b))
         XCTAssertTrue(a.readsLike(a))
+    }
+
+    // MARK: v1.1
+
+    func holdingDash(_ names: [String], stranded: [String: Int] = [:], queuedFor: TimeInterval? = nil) -> Dashboard {
+        var dash = Dashboard()
+        dash.lanes = [Lane(repo: "o/r", key: "x", runners: names.map {
+            RunnerRow(repo: "o/r", name: $0, os: nil, labels: ["self-hosted", "x"], state: .holding,
+                      currentJob: nil, log: nil, lastSeen: now)
+        }, queued: [])]
+        dash.stranded = stranded
+        if let queuedFor {
+            dash.queued = [jobInfo(created: -queuedFor)]
+        }
+        return dash
+    }
+
+    func jobInfo(created: TimeInterval) -> JobInfo {
+        StatusRules.jobInfo(repo: "o/r", run: run(1, status: "queued"), job: job(9, run: 1, "queued", labels: ["x"], created: created))
+    }
+
+    func testAlertsCoverHoldsStrandedAndLongQueues() {
+        let dash = holdingDash(["mac"], stranded: ["macos": 2], queuedFor: 11 * 60)
+        let keys = AlertRules.alerts(dash, now: now).map(\.key)
+        XCTAssertEqual(keys, ["hold:mac", "stranded:macos", "long-queue"])
+        XCTAssertTrue(AlertRules.alerts(holdingDash([], queuedFor: 9 * 60), now: now).isEmpty, "under 10 minutes is quiet")
+    }
+
+    func testEachProblemNotifiesOnceAndHoldsSayWhenTheyClear() {
+        let first = AlertRules.alerts(holdingDash(["mac"], queuedFor: 11 * 60), now: now)
+        var (raised, cleared) = AlertRules.changes(previous: [:], current: first)
+        XCTAssertEqual(raised.map(\.key), ["hold:mac", "long-queue"])
+        XCTAssertTrue(cleared.isEmpty)
+        let active = Dictionary(uniqueKeysWithValues: first.map { ($0.key, $0) })
+        (raised, cleared) = AlertRules.changes(previous: active, current: first)
+        XCTAssertTrue(raised.isEmpty, "no repeat while it stays red")
+        (raised, cleared) = AlertRules.changes(previous: active, current: [])
+        XCTAssertEqual(cleared.map(\.key), ["hold:mac"], "a drained queue doesn't notify")
+    }
+
+    @MainActor
+    func testStoreNotifiesAHoldOnceAndItsClear() async throws {
+        let suite = "io.github.che1195.CIDashboard.tests"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
+        var settings = AppSettings()
+        settings.logSources = [source("mac", host: "h")]
+        SettingsStore.save(settings, defaults)
+        // Calls 1 and 2 show the hold; call 3 shows it cleared. GitHub is unreachable throughout.
+        let runner = GatedRunner { $0 < 3 ? "cleanup failed\n" : "cleanup succeeded\n" }
+        runner.open()
+        let notifier = SilentNotifier()
+        let store = DashboardStore(commandRunner: runner, defaults: defaults, notifier: notifier)
+        for _ in 0..<3 { await store.refresh() }
+        XCTAssertEqual(notifier.posted.map { "\($0.alert.key) \($0.cleared)" }, ["hold:mac false", "hold:mac true"])
+
+        store.settings.notify = false
+        SettingsStore.saveHolds(["mac": now], defaults)
+        XCTAssertEqual(notifier.posted.count, 2)
+    }
+
+    func testDisabledRunnerShowsDisabledOnlyWhileOffline() {
+        XCTAssertEqual(StatusRules.runnerState(status: "offline", busy: false, holding: nil, disabled: true), .disabled)
+        XCTAssertEqual(StatusRules.runnerState(status: "online", busy: true, holding: nil, disabled: true), .busy)
+        XCTAssertEqual(StatusRules.runnerState(status: "offline", busy: false, holding: true, disabled: true), .holding)
+        var snap = RepoSnapshot(repo: "o/r")
+        snap.runners = [runner("Mini-Web1", "offline", busy: false, labels: ["self-hosted", "x"])]
+        let dash = StatusRules.build(snapshots: [snap], logs: [:], seen: [], now: now, disabled: ["mini-web1"])
+        XCTAssertEqual(dash.lanes.first?.runners.first?.state, .disabled)
+        XCTAssertEqual(dash.overall.level, .green)
+    }
+
+    @MainActor
+    func testStoreRemembersDisabledRunners() throws {
+        let suite = "io.github.che1195.CIDashboard.tests"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = DashboardStore(commandRunner: HangingRunner(), defaults: defaults, notifier: SilentNotifier())
+        store.setDisabled("Mini-Web1", true)
+        XCTAssertTrue(store.isDisabled("mini-web1"))
+        XCTAssertEqual(SettingsStore.load(defaults).disabledRunners, ["mini-web1"])
+        store.setDisabled("mini-web1", false)
+        XCTAssertFalse(store.isDisabled("Mini-Web1"))
     }
 }
 

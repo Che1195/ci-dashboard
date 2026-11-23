@@ -1,3 +1,4 @@
+import ServiceManagement
 import SwiftUI
 
 struct SettingsView: View {
@@ -90,6 +91,11 @@ private struct ReposSettings: View {
 private struct LogSettings: View {
     @Bindable var store: DashboardStore
     @State private var selection: LogSource.ID?
+    /// Unsaved edits by row, kept while you switch rows; Save or Revert ends one.
+    @State private var drafts: [LogSource.ID: LogSource] = [:]
+
+    private func saved(_ id: LogSource.ID) -> LogSource? { store.settings.logSources.first { $0.id == id } }
+    private func hasDraft(_ source: LogSource) -> Bool { drafts[source.id].map { $0 != source } ?? false }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -101,16 +107,25 @@ private struct LogSettings: View {
                     ForEach(store.settings.logSources) { source in
                         VStack(alignment: .leading) {
                             Text(source.runnerName.isEmpty ? "New runner log" : source.runnerName)
-                            Text(source.host.isEmpty ? "This Mac" : source.host).font(.caption).foregroundStyle(.secondary)
+                            Text((source.host.isEmpty ? "This Mac" : source.host) + (hasDraft(source) ? " · not saved" : ""))
+                                .font(.caption).foregroundStyle(hasDraft(source) ? Color.orange : Color.secondary)
                         }
                         .tag(source.id)
                     }
                 }
                 .frame(minWidth: 160, maxWidth: 200)
                 Group {
-                    if let index = store.settings.logSources.firstIndex(where: { $0.id == selection }) {
-                        LogSourceEditor(source: $store.settings.logSources[index])
-                            .id(store.settings.logSources[index].id)
+                    if let id = selection, let source = saved(id) {
+                        LogSourceEditor(
+                            source: source,
+                            draft: Binding(get: { drafts[id] ?? saved(id) ?? source }, set: { drafts[id] = $0 }),
+                            save: {
+                                if let draft = drafts[id], let i = store.settings.logSources.firstIndex(where: { $0.id == id }) {
+                                    store.settings.logSources[i] = draft
+                                }
+                                drafts[id] = nil
+                            },
+                            revert: { drafts[id] = nil })
                     } else {
                         Text("Select or add a runner log.").foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -125,6 +140,7 @@ private struct LogSettings: View {
                     selection = source.id
                 } label: { Image(systemName: "plus") }
                 Button {
+                    if let id = selection { drafts[id] = nil }
                     store.settings.logSources.removeAll { $0.id == selection }
                     selection = nil
                 } label: { Image(systemName: "minus") }
@@ -139,13 +155,10 @@ private struct LogSettings: View {
 /// Edits a copy; nothing reaches the settings (or the next log read) until Save. A half-typed path or pattern is
 /// never used to judge whether a runner is holding.
 private struct LogSourceEditor: View {
-    @Binding var source: LogSource
-    @State private var draft: LogSource
-
-    init(source: Binding<LogSource>) {
-        _source = source
-        _draft = State(initialValue: source.wrappedValue)
-    }
+    let source: LogSource
+    @Binding var draft: LogSource
+    let save: () -> Void
+    let revert: () -> Void
 
     var body: some View {
         let problem = draft.saveProblem
@@ -166,9 +179,9 @@ private struct LogSourceEditor: View {
                     Text("Not saved").font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button("Revert") { draft = source }
+                Button("Revert", action: revert)
                     .disabled(!changed)
-                Button("Save") { source = draft }
+                Button("Save", action: save)
                     .keyboardShortcut(.defaultAction)
                     .disabled(!changed || problem != nil)
             }
@@ -179,9 +192,34 @@ private struct LogSourceEditor: View {
 
 private struct GeneralSettings: View {
     @Bindable var store: DashboardStore
+    /// The system's login-item state is the truth; this mirrors it.
+    @State private var loginStatus = SMAppService.mainApp.status
+    @State private var loginError: String?
 
     var body: some View {
         Form {
+            Toggle("Launch at login", isOn: Binding(
+                get: { loginStatus == .enabled || loginStatus == .requiresApproval },
+                set: { on in
+                    do {
+                        if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+                        loginError = nil
+                    } catch {
+                        loginError = error.localizedDescription
+                    }
+                    loginStatus = SMAppService.mainApp.status
+                }))
+            if loginStatus == .requiresApproval {
+                HStack {
+                    Text("Allow it in System Settings → General → Login Items.").font(.caption).foregroundStyle(.orange)
+                    Button("Open") { SMAppService.openSystemSettingsLoginItems() }
+                }
+            }
+            if let loginError { Text(loginError).font(.caption).foregroundStyle(.red) }
+            Toggle("Notify when something goes red", isOn: $store.settings.notify)
+            Text("A runner holding, jobs no runner can take, or a job queued over 10 minutes. Each notifies once, and again when a hold or stuck job clears.")
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
             Picker("Refresh every", selection: $store.settings.refreshSeconds) {
                 ForEach(AppSettings.refreshChoices, id: \.self) { Text("\($0) seconds").tag($0) }
             }
@@ -193,5 +231,6 @@ private struct GeneralSettings: View {
             }
         }
         .formStyle(.grouped)
+        .onAppear { loginStatus = SMAppService.mainApp.status }
     }
 }

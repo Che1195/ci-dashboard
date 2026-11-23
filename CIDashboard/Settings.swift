@@ -28,7 +28,8 @@ struct LogSource: Codable, Hashable, Identifiable, Sendable {
     /// Why this source can't be saved as it stands, or nil.
     var saveProblem: String? {
         if StatusRules.regex(holdPattern) == nil { return "“Holding when” needs a valid pattern." }
-        if !clearPattern.isEmpty && StatusRules.regex(clearPattern) == nil { return "“Cleared when” isn't a valid pattern." }
+        // Without a clear pattern a hold could never end.
+        if StatusRules.regex(clearPattern) == nil { return "“Cleared when” needs a valid pattern." }
         return nil
     }
 
@@ -49,6 +50,10 @@ struct AppSettings: Codable, Equatable, Sendable {
     var ghPath = ""
     var logSources: [LogSource] = []
     var hourlyDiscovery = false
+    /// Runners parked on purpose (lowercased names): offline shows as Disabled, not as a problem.
+    var disabledRunners: [String] = []
+    /// Send a notification when something goes red.
+    var notify = true
 
     init() {}
 
@@ -59,6 +64,8 @@ struct AppSettings: Codable, Equatable, Sendable {
         ghPath = try c.decodeIfPresent(String.self, forKey: .ghPath) ?? ""
         logSources = try c.decodeIfPresent([LogSource].self, forKey: .logSources) ?? []
         hourlyDiscovery = try c.decodeIfPresent(Bool.self, forKey: .hourlyDiscovery) ?? false
+        disabledRunners = try c.decodeIfPresent([String].self, forKey: .disabledRunners) ?? []
+        notify = try c.decodeIfPresent(Bool.self, forKey: .notify) ?? true
     }
 
     /// Drops repos that repeat an earlier one ignoring case, keeping the first spelling.
