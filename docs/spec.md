@@ -78,6 +78,8 @@ These assume the setup the app is built for: your own Macs as runner hosts, and 
   runs as it would for any ssh login; a Windows host's `cmd.exe` would not honour the POSIX quoting. If the log path
   is a named pipe, the remote `tail` can block after the local deadline kills `ssh`. Point log sources only at
   regular log files on hosts you control.
+- **Log-source edits apply on Save.** The editor works on a copy; patterns must be valid regular expressions to save.
+  `ssh` asks `tail` for 201 lines and keeps the last 200 whole ones (an unfinished last line is never matched).
 - **ssh sees only `HOME`, `USER`, `LOGNAME`, `SSH_AUTH_SOCK`, `TMPDIR`, `LANG` and a fixed `PATH`**, so no
   `SendEnv` setting can pass a token on.
 - **A custom `gh` path is trusted.** The app runs whatever executable that setting names, and finding it runs on the

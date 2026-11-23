@@ -17,7 +17,8 @@ enum LogReader {
          // Stay in the foreground with no shared connection, so the deadline covers the whole session.
          "-o", "ForkAfterAuthentication=no", "-o", "ControlMaster=no", "-o", "ControlPath=none",
          "-T", "--", host,
-         "tail -n \(lineCount) -- \(shellQuote(path))"]
+         // One extra line: `tail` counts a final line the writer hasn't finished, and that line is dropped below.
+         "tail -n \(lineCount + 1) -- \(shellQuote(path))"]
     }
 
     /// One source per runner name: the first in the list wins, so a duplicate can't flip the result between polls.
@@ -117,7 +118,7 @@ enum LogReader {
             throw GitHubError.failed(msg)
         }
         // `tail` starts at a line boundary, but its output ends mid-line when the writer hasn't finished the last line.
-        return TailResult(lines: wholeLines(result.stdout), complete: true)
+        return TailResult(lines: Array(wholeLines(result.stdout).suffix(lineCount)), complete: true)
     }
 
     /// Only the lines that end in a newline. What follows the last newline is either nothing or a line the writer

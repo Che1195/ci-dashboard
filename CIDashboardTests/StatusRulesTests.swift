@@ -41,8 +41,8 @@ final class StatusRulesTests: XCTestCase {
         for option in ["BatchMode=yes", "ConnectTimeout=4", "ClearAllForwardings=yes", "PermitLocalCommand=no"] {
             XCTAssertTrue(args.contains(option), option)
         }
-        XCTAssertEqual(args.last, "tail -n 200 -- '/var/log/it'\\''s.log'")
-        XCTAssertEqual(LogReader.sshArguments(host: "h", path: "-n").last, "tail -n 200 -- '-n'")
+        XCTAssertEqual(args.last, "tail -n 201 -- '/var/log/it'\\''s.log'")
+        XCTAssertEqual(LogReader.sshArguments(host: "h", path: "-n").last, "tail -n 201 -- '-n'")
         XCTAssertEqual(args[args.count - 2], "mini.local")
         XCTAssertEqual(args[args.count - 3], "--")
     }
@@ -578,6 +578,7 @@ final class StatusRulesTests: XCTestCase {
     func testConfirmedHoldsSurviveARelaunch() throws {
         let suite = "io.github.che1195.CIDashboard.tests"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
         defer { defaults.removePersistentDomain(forName: suite) }
         SettingsStore.saveHolds(["mac": now], defaults)
         XCTAssertEqual(SettingsStore.loadHolds(defaults), ["mac": now])
@@ -704,6 +705,7 @@ final class StatusRulesTests: XCTestCase {
     func testStoreKeepsAHoldThroughAHalfTypedPattern() async throws {
         let suite = "io.github.che1195.CIDashboard.tests"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
         defer { defaults.removePersistentDomain(forName: suite) }
         var settings = AppSettings()
         settings.logSources = [source("mac", host: "h", clear: "cleanup succeeded|")]   // "…|" matches every line
@@ -714,7 +716,11 @@ final class StatusRulesTests: XCTestCase {
         let store = DashboardStore(commandRunner: runner, defaults: defaults)
 
         let refresh = Task { await store.refresh() }
-        while runner.sshCalls == 0 { try await Task.sleep(for: .milliseconds(5)) }
+        let waitUntil = Date().addingTimeInterval(10)
+        while runner.sshCalls == 0 {
+            guard Date() < waitUntil else { return XCTFail("refresh never ran ssh") }
+            try await Task.sleep(for: .milliseconds(5))
+        }
         store.settings.logSources[0].clearPattern = "cleanup succeeded|waiting for a job"
         runner.open()
         await refresh.value
@@ -731,6 +737,7 @@ final class StatusRulesTests: XCTestCase {
     func testStoreKeepsAClearLineThroughAnUnrelatedEdit() async throws {
         let suite = "io.github.che1195.CIDashboard.tests"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
         defer { defaults.removePersistentDomain(forName: suite) }
         var settings = AppSettings()
         settings.logSources = [source("mac", host: "h")]
@@ -741,7 +748,11 @@ final class StatusRulesTests: XCTestCase {
         let store = DashboardStore(commandRunner: runner, defaults: defaults)
 
         let refresh = Task { await store.refresh() }
-        while runner.sshCalls == 0 { try await Task.sleep(for: .milliseconds(5)) }
+        let waitUntil = Date().addingTimeInterval(10)
+        while runner.sshCalls == 0 {
+            guard Date() < waitUntil else { return XCTFail("refresh never ran ssh") }
+            try await Task.sleep(for: .milliseconds(5))
+        }
         store.addRepo("o/r")
         runner.open()
         await refresh.value
@@ -757,6 +768,7 @@ final class StatusRulesTests: XCTestCase {
     func testStoreStartsWithRestoredHolds() throws {
         let suite = "io.github.che1195.CIDashboard.tests"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
         defer { defaults.removePersistentDomain(forName: suite) }
         var settings = AppSettings()
         settings.logSources = [source("mac")]
@@ -931,6 +943,7 @@ final class StatusRulesTests: XCTestCase {
         // The same through the path a saved hold takes: decoded from defaults, then shown.
         let suite = "io.github.che1195.CIDashboard.tests"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
         defer { defaults.removePersistentDomain(forName: suite) }
         defaults.set(Data(#"{"future":1e30,"past":-1e30}"#.utf8), forKey: SettingsStore.holdsKey)
         let restored = SettingsStore.loadHolds(defaults)
@@ -941,6 +954,42 @@ final class StatusRulesTests: XCTestCase {
         let dash = StatusRules.restoredDashboard(
             holds: restored, sources: [source("future"), source("past")], repos: [], seen: [], now: now)
         XCTAssertEqual(dash.unplacedHolds, ["future", "past"])
+    }
+
+    // MARK: Fix review 5
+
+    func testSSHKeepsTwoHundredWholeLinesWhenTheLastIsUnfinished() async {
+        // A clear marker, 199 complete noise lines, then a line the writer hasn't finished.
+        let body = "cleanup succeeded\n" + String(repeating: "noise\n", count: 199) + "half a li"
+        // Behaves like `tail -n N`: the last N lines, counting the unfinished one.
+        let runner = RecordingRunner { args in
+            let words = (args.last ?? "").split(separator: " ")
+            guard let i = words.firstIndex(of: "-n"), let n = Int(words[i + 1]) else { return nil }
+            return body.split(separator: "\n", omittingEmptySubsequences: false).suffix(n).joined(separator: "\n")
+        }
+        var source = LogSource(); source.runnerName = "r"; source.host = "h"; source.path = "/p"
+        let status = await LogReader.read(source, runner: runner)
+        XCTAssertEqual(status.holding, false, "the 200th whole line is still checked")
+    }
+
+    func testSaveRefusesInvalidPatterns() {
+        var source = LogSource(); source.runnerName = "r"; source.path = "/p"
+        XCTAssertNil(source.saveProblem)
+        source.holdPattern = "(unclosed"
+        XCTAssertNotNil(source.saveProblem)
+        source.holdPattern = ""
+        XCTAssertNotNil(source.saveProblem)
+        source.holdPattern = "cleanup failed"; source.clearPattern = "[x"
+        XCTAssertNotNil(source.saveProblem)
+        source.clearPattern = ""
+        XCTAssertNil(source.saveProblem, "no clear pattern is allowed")
+    }
+
+    func testDifferentlyEncodedPathsAreDifferentSources() {
+        var a = LogSource(); a.runnerName = "r"; a.host = "h"; a.path = "/logs/caf\u{E9}.log"
+        var b = a; b.path = "/logs/cafe\u{301}.log"
+        XCTAssertFalse(a.readsLike(b))
+        XCTAssertTrue(a.readsLike(a))
     }
 }
 

@@ -25,10 +25,18 @@ struct LogSource: Codable, Hashable, Identifiable, Sendable {
         clearPattern = try c.decodeIfPresent(String.self, forKey: .clearPattern) ?? Self.defaultClear
     }
 
+    /// Why this source can't be saved as it stands, or nil.
+    var saveProblem: String? {
+        if StatusRules.regex(holdPattern) == nil { return "“Holding when” needs a valid pattern." }
+        if !clearPattern.isEmpty && StatusRules.regex(clearPattern) == nil { return "“Cleared when” isn't a valid pattern." }
+        return nil
+    }
+
     /// True when both read the same log for the same runner and judge it by the same patterns (the row's `id`
     /// plays no part). Log results count only for a source that is still like the one that was read.
     func readsLike(_ other: LogSource) -> Bool {
-        runnerName == other.runnerName && host == other.host && path == other.path
+        // Host and path by their bytes: two spellings Swift calls equal (é composed or not) can be different files.
+        runnerName == other.runnerName && host.utf8.elementsEqual(other.host.utf8) && path.utf8.elementsEqual(other.path.utf8)
             && holdPattern == other.holdPattern && clearPattern == other.clearPattern
     }
 }

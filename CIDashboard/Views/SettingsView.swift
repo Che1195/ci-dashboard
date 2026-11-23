@@ -110,6 +110,7 @@ private struct LogSettings: View {
                 Group {
                     if let index = store.settings.logSources.firstIndex(where: { $0.id == selection }) {
                         LogSourceEditor(source: $store.settings.logSources[index])
+                            .id(store.settings.logSources[index].id)
                     } else {
                         Text("Select or add a runner log.").foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -135,19 +136,42 @@ private struct LogSettings: View {
     }
 }
 
+/// Edits a copy; nothing reaches the settings (or the next log read) until Save. A half-typed path or pattern is
+/// never used to judge whether a runner is holding.
 private struct LogSourceEditor: View {
     @Binding var source: LogSource
+    @State private var draft: LogSource
+
+    init(source: Binding<LogSource>) {
+        _source = source
+        _draft = State(initialValue: source.wrappedValue)
+    }
 
     var body: some View {
+        let problem = draft.saveProblem
+        let changed = draft != source
         Form {
-            TextField("Runner name", text: $source.runnerName, prompt: Text("exactly as GitHub shows it"))
-            TextField("SSH host", text: $source.host, prompt: Text("empty = a file on this Mac"))
-            TextField("Log path", text: $source.path, prompt: Text("/path/to/runner.log"))
-            TextField("Holding when", text: $source.holdPattern)
-            TextField("Cleared when", text: $source.clearPattern)
-            Text("Patterns are case-insensitive regular expressions. The runner is holding when the latest line that matches either pattern matches “Holding when”.")
+            TextField("Runner name", text: $draft.runnerName, prompt: Text("exactly as GitHub shows it"))
+            TextField("SSH host", text: $draft.host, prompt: Text("empty = a file on this Mac"))
+            TextField("Log path", text: $draft.path, prompt: Text("/path/to/runner.log"))
+            TextField("Holding when", text: $draft.holdPattern)
+            TextField("Cleared when", text: $draft.clearPattern)
+            Text("Patterns are case-insensitive regular expressions. The runner is holding when the latest line that matches either pattern matches “Holding when”. Changes apply when you click Save.")
                 .font(.caption).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                if let problem, changed {
+                    Text(problem).font(.caption).foregroundStyle(.red)
+                } else if changed {
+                    Text("Not saved").font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Revert") { draft = source }
+                    .disabled(!changed)
+                Button("Save") { source = draft }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(!changed || problem != nil)
+            }
         }
         .formStyle(.grouped)
     }
