@@ -75,8 +75,8 @@ struct APIRateLimit: Decodable, Sendable {
 struct RepoSnapshot: Sendable {
     var repo: String
     var runners: [APIRunner] = []
-    /// Runs that are queued, waiting or in progress, with their jobs.
-    var runs: [(run: APIRun, jobs: [APIJob])] = []
+    /// Runs that are queued, waiting or in progress, with their jobs (nil when the jobs couldn't be read).
+    var runs: [(run: APIRun, jobs: [APIJob]?)] = []
     var error: String?
     /// The runner list was read. Without it, remembered runners and new sightings are left alone.
     var runnersOK = true

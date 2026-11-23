@@ -35,6 +35,9 @@ final class DashboardStore {
     private(set) var lastDiscovery: Date?
 
     private var seen: [SeenRunner]
+    /// Advances every 5 s; views that show age-based status read it so they re-evaluate between refreshes.
+    private(set) var clock = Date()
+    private var clockLoop: Task<Void, Never>?
     private var refreshLoop: Task<Void, Never>?
     private var discoveryLoop: Task<Void, Never>?
     private let commandRunner: CommandRunning
@@ -49,10 +52,13 @@ final class DashboardStore {
         if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil { startLoops() }
     }
 
-    /// The dashboard's status, with a GitHub/gh error added on top (it never hides a red).
-    var overall: OverallStatus {
-        guard let globalError else { return dashboard.overall }
-        var status = dashboard.overall
+    /// The status now. Queue-age thresholds are re-checked against the clock, so a job crossing 3 or 10 minutes
+    /// changes the colour without waiting for the next GitHub refresh.
+    var overall: OverallStatus { overall(at: Date()) }
+
+    func overall(at now: Date) -> OverallStatus {
+        var status = StatusRules.overall(dashboard, now: now)
+        guard let globalError else { return status }
         status.level = max(status.level, .orange)
         status.reasons.insert(globalError, at: 0)
         return status
@@ -64,6 +70,14 @@ final class DashboardStore {
     }
 
     func startLoops() {
+        if clockLoop == nil {
+            clockLoop = Task { [weak self] in
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .seconds(5))
+                    self?.clock = Date()
+                }
+            }
+        }
         refreshLoop?.cancel()
         let interval = max(10, settings.refreshSeconds)
         refreshLoop = Task { [weak self] in

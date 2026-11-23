@@ -146,7 +146,7 @@ struct GitHubClient: Sendable {
         }
         let cutOff = results.filter { ($0.2?.total_count ?? 0) > ($0.2?.jobs.count ?? 0) }.count
         if cutOff > 0 { errors.append("only the first \(Self.jobsPerPage) jobs of \(cutOff) large run\(cutOff == 1 ? "" : "s") are shown") }
-        snap.runs = results.compactMap { item in item.2.map { (run: item.1, jobs: $0.jobs) } }
+        snap.runs = results.map { (run: $0.1, jobs: $0.2?.jobs) }
 
         if !errors.isEmpty { snap.error = "\(repo): " + errors.joined(separator: "; ") }
         return snap

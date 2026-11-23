@@ -9,6 +9,11 @@ struct DashboardView: View {
     private var multiRepo: Bool { store.settings.repos.count > 1 }
 
     var body: some View {
+        // Ticks every second: elapsed times, and status colours that depend on queue age.
+        TimelineView(.periodic(from: .now, by: 1)) { _ in content }
+    }
+
+    private var content: some View {
         VStack(spacing: 0) {
             header
             Divider()
@@ -261,11 +266,11 @@ struct QueuedRow: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(job.name).font(.body.weight(.medium)).lineLimit(1)
                     Text(context).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                    let custom = StatusRules.customLabels(job.labels)
                     if !job.labels.isEmpty {
-                        Chip(text: job.isSelfHosted ? "needs \(custom.isEmpty ? "self-hosted" : custom.joined(separator: " + "))"
+                        Chip(text: job.isSelfHosted ? "needs \(StatusRules.requirement(job.labels))"
                                                     : "GitHub-hosted: \(job.labels.joined(separator: ", "))",
                              systemImage: "tag")
+                        .help(job.stranded ? "No online runner carries all of these labels." : "Labels this job asks for.")
                     }
                 }
                 Spacer(minLength: 8)

@@ -9,8 +9,13 @@ enum LogReader {
     /// The exact ssh arguments used. Tested: always `tail`, batch mode, a connect timeout, no forwarding or local
     /// commands from the user's ssh config, and `--` so a path starting with `-` stays a file name.
     static func sshArguments(host: String, path: String) -> [String] {
-        ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "ClearAllForwardings=yes",
-         "-o", "PermitLocalCommand=no", "-o", "ForwardAgent=no", "-o", "ForwardX11=no", "-T", "--", host,
+        ["-o", "BatchMode=yes", "-o", "ConnectTimeout=4", "-o", "ClearAllForwardings=yes",
+         "-o", "PermitLocalCommand=no", "-o", "ForwardAgent=no", "-o", "ForwardX11=no",
+         // Never write known_hosts during a poll, and only talk to hosts already trusted.
+         "-o", "UpdateHostKeys=no", "-o", "StrictHostKeyChecking=yes",
+         // Stay in the foreground with no shared connection, so the deadline covers the whole session.
+         "-o", "ForkAfterAuthentication=no", "-o", "ControlMaster=no", "-o", "ControlPath=none",
+         "-T", "--", host,
          "tail -n \(lineCount) -- \(shellQuote(path))"]
     }
 
@@ -24,10 +29,14 @@ enum LogReader {
         "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
+    /// Every log read returns within this, even if a file read hangs (say, a network drive whose server went away).
+    static let readDeadline: TimeInterval = 9
+    static let sshTimeout: TimeInterval = 5
+
     static func readAll(_ sources: [LogSource], runner: CommandRunning) async -> [String: LogStatus] {
         await withTaskGroup(of: (String, LogStatus).self) { group in
             for source in uniqueSources(sources) {
-                group.addTask { (source.runnerName, await read(source, runner: runner)) }
+                group.addTask { (source.runnerName, await readWithDeadline(source, runner: runner)) }
             }
             var out: [String: LogStatus] = [:]
             for await (name, status) in group { out[name] = status }
@@ -35,40 +44,69 @@ enum LogReader {
         }
     }
 
+    /// Races the read against the deadline without waiting for a read that never returns.
+    static func readWithDeadline(_ source: LogSource, runner: CommandRunning,
+                                 deadline: TimeInterval = readDeadline) async -> LogStatus {
+        await withCheckedContinuation { continuation in
+            let once = ResumeOnce(continuation)
+            Task.detached { once.resume(await read(source, runner: runner)) }
+            DispatchQueue.global().asyncAfter(deadline: .now() + deadline) {
+                once.resume(LogStatus(holding: nil, lastLine: nil, error: "log read timed out"))
+            }
+        }
+    }
+
     static func read(_ source: LogSource, runner: CommandRunning) async -> LogStatus {
-        let lines: [String]
+        let result: TailResult
         do {
-            lines = try await tail(source, runner: runner)
+            result = try await tail(source, runner: runner)
         } catch {
             return LogStatus(holding: nil, lastLine: nil, error: error.localizedDescription)
         }
-        let nonEmpty = lines.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
-        return LogStatus(
-            holding: StatusRules.isHolding(
-                lines: nonEmpty, holdPattern: source.holdPattern, clearPattern: source.clearPattern),
-            lastLine: nonEmpty.last.map { String($0.prefix(160)) },
-            error: nil)
+        let nonEmpty = result.lines.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+        let holding = StatusRules.isHolding(
+            lines: nonEmpty, holdPattern: source.holdPattern, clearPattern: source.clearPattern)
+        // A read that couldn't cover the last 200 lines can't prove "not holding": say so on the row.
+        let note = (!result.complete && holding != true) ? "only part of the last \(lineCount) lines could be read" : nil
+        return LogStatus(holding: result.complete ? holding : (holding == true ? true : nil),
+                         lastLine: nonEmpty.last.map { String($0.prefix(160)) }, error: note)
     }
 
-    static func tail(_ source: LogSource, runner: CommandRunning) async throws -> [String] {
+    struct TailResult: Sendable {
+        let lines: [String]
+        /// False when the read limit stopped it before the last `lineCount` lines were all read.
+        let complete: Bool
+    }
+
+    static func tail(_ source: LogSource, runner: CommandRunning) async throws -> TailResult {
         let host = source.host.trimmingCharacters(in: .whitespaces)
         if host.isEmpty {
-            return try localTail(path: (source.path as NSString).expandingTildeInPath)
+            let path = (source.path as NSString).expandingTildeInPath
+            // File reads run on a GCD thread, not the Swift task pool, so a hung read can't starve other work.
+            return try await withCheckedThrowingContinuation { continuation in
+                DispatchQueue.global(qos: .utility).async {
+                    continuation.resume(with: Result { try localTailResult(path: path) })
+                }
+            }
         }
         guard !source.path.contains("\n"), !host.contains(" "), !host.hasPrefix("-") else {
             throw GitHubError.failed("Invalid host or path")
         }
-        let result = try await runner.run("/usr/bin/ssh", sshArguments(host: host, path: source.path), timeout: 8)
+        let result = try await runner.run("/usr/bin/ssh", sshArguments(host: host, path: source.path), timeout: sshTimeout)
         if result.timedOut { throw GitHubError.failed("ssh timed out") }
         guard result.status == 0 else {
             let msg = String(decoding: result.stderr, as: UTF8.self)
                 .split(separator: "\n").last.map(String.init) ?? "ssh exited with \(result.status)"
             throw GitHubError.failed(msg)
         }
-        return String(decoding: result.stdout, as: UTF8.self).components(separatedBy: "\n")
+        var lines = String(decoding: result.stdout, as: UTF8.self).components(separatedBy: "\n")
+        if lines.last == "" { lines.removeLast() }
+        return TailResult(lines: lines, complete: true)
     }
 
-    static func localTail(path: String) throws -> [String] {
+    static func localTail(path: String) throws -> [String] { try localTailResult(path: path).lines }
+
+    static func localTailResult(path: String) throws -> TailResult {
         // Open without blocking (a named pipe would otherwise wait forever for a writer) and accept only regular files.
         let fd = open(path, O_RDONLY | O_NONBLOCK)
         guard fd >= 0 else { throw GitHubError.failed(String(cString: strerror(errno))) }
@@ -91,6 +129,8 @@ enum LogReader {
             // Enough newlines for the last lineCount physical lines (like `tail -n`), or the safety limit.
             if data.reduce(0, { $1 == 0x0A ? $0 + 1 : $0 }) > lineCount || size - offset >= localReadLimit { break }
         }
+        let newlines = data.reduce(0) { $1 == 0x0A ? $0 + 1 : $0 }
+        let complete = offset == 0 || newlines > lineCount
         var physical = String(decoding: data, as: UTF8.self).components(separatedBy: "\n")
         if physical.last == "" { physical.removeLast() }          // the file's final newline
         // The first line is partial unless it starts the file or follows a newline just before what we read.
@@ -99,6 +139,21 @@ enum LogReader {
             let before = try handle.read(upToCount: 1) ?? Data()
             if before.first != 0x0A { physical.removeFirst() }
         }
-        return Array(physical.suffix(lineCount))
+        return TailResult(lines: Array(physical.suffix(lineCount)), complete: complete)
+    }
+}
+
+/// Resumes a continuation once; later calls are ignored.
+private final class ResumeOnce<T: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<T, Never>?
+    init(_ continuation: CheckedContinuation<T, Never>) { self.continuation = continuation }
+    func resume(_ value: T) {
+        let c: CheckedContinuation<T, Never>? = lock.withLock {
+            let c = continuation
+            continuation = nil
+            return c
+        }
+        c?.resume(returning: value)
     }
 }

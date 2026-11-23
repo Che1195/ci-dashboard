@@ -38,7 +38,7 @@ final class StatusRulesTests: XCTestCase {
 
     func testSSHOnlyRunsTailInBatchMode() {
         let args = LogReader.sshArguments(host: "mini.local", path: "/var/log/it's.log")
-        for option in ["BatchMode=yes", "ConnectTimeout=5", "ClearAllForwardings=yes", "PermitLocalCommand=no"] {
+        for option in ["BatchMode=yes", "ConnectTimeout=4", "ClearAllForwardings=yes", "PermitLocalCommand=no"] {
             XCTAssertTrue(args.contains(option), option)
         }
         XCTAssertEqual(args.last, "tail -n 200 -- '/var/log/it'\\''s.log'")
@@ -373,6 +373,64 @@ final class StatusRulesTests: XCTestCase {
         XCTAssertLessThanOrEqual(result.stdout.count, 8 * 1024 * 1024)
     }
 
+    func testFailedJobsKeepQueuedRunAndItsAge() {
+        var snap = RepoSnapshot(repo: "o/r")
+        snap.runs = [(run: run(7, status: "queued", created: -11 * 60), jobs: nil)]
+        let dash = StatusRules.build(snapshots: [snap], logs: [:], seen: [], now: now)
+        XCTAssertEqual(dash.queued.map(\.id), [-7])
+        XCTAssertEqual(dash.overall.level, .red)
+    }
+
+    func testHoldingSurvivesFailedRunnerList() {
+        var snap = RepoSnapshot(repo: "o/r")
+        snap.runnersOK = false
+        snap.runnersComplete = false
+        let seen = [SeenRunner(repo: "o/r", name: "mac", labels: ["self-hosted", "x"], os: nil, lastSeen: now),
+                    SeenRunner(repo: "o/r", name: "other", labels: ["self-hosted", "x"], os: nil, lastSeen: now)]
+        let logs = ["mac": LogStatus(holding: true, lastLine: "cleanup failed", error: nil)]
+        let dash = StatusRules.build(snapshots: [snap], logs: logs, seen: seen, now: now)
+        XCTAssertEqual(dash.lanes.flatMap(\.runners).map(\.name), ["mac"])
+        XCTAssertEqual(dash.overall.level, .red)
+    }
+
+    func testRequirementShowsPlatformLabels() {
+        XCTAssertEqual(StatusRules.requirement(["self-hosted", "macOS", "ARM64", "build"]), "arm64 + build + macos")
+        XCTAssertEqual(StatusRules.requirement(["self-hosted"]), "self-hosted")
+    }
+
+    func testOverallRecomputesAgainstTheClock() {
+        var snap = RepoSnapshot(repo: "o/r")
+        snap.runners = [runner("w", "online", busy: true, labels: ["self-hosted", "x"])]
+        snap.runs = [(run: run(1, status: "queued"), jobs: [job(1, run: 1, "queued", labels: ["self-hosted", "x"], created: -170)])]
+        let dash = StatusRules.build(snapshots: [snap], logs: [:], seen: [], now: now)
+        XCTAssertEqual(StatusRules.overall(dash, now: now).level, .blue)
+        XCTAssertEqual(StatusRules.overall(dash, now: now.addingTimeInterval(20)).level, .orange)
+    }
+
+    func testLogReadDeadlineReturnsWhileReadHangs() async {
+        let hanging = HangingRunner()
+        var source = LogSource(); source.runnerName = "r"; source.host = "h"; source.path = "/p"
+        let start = Date()
+        let status = await LogReader.readWithDeadline(source, runner: hanging, deadline: 0.5)
+        XCTAssertEqual(status.error, "log read timed out")
+        XCTAssertLessThan(Date().timeIntervalSince(start), 3)
+    }
+
+    func testIncompleteLocalTailCantClearAHold() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("inc-\(UUID()).log")
+        defer { try? FileManager.default.removeItem(at: url) }
+        // One line longer than the read limit: nothing complete fits, so the result is incomplete.
+        try String(repeating: "z", count: Int(LogReader.localReadLimit) + 10).write(to: url, atomically: true, encoding: .utf8)
+        XCTAssertFalse(try LogReader.localTailResult(path: url.path).complete)
+    }
+
+    func testSSHNeverUpdatesKnownHosts() {
+        let args = LogReader.sshArguments(host: "h", path: "/p")
+        for option in ["UpdateHostKeys=no", "StrictHostKeyChecking=yes", "ForkAfterAuthentication=no", "ControlMaster=no"] {
+            XCTAssertTrue(args.contains(option), option)
+        }
+    }
+
     /// Every command the client actually runs, through its real call sites, is `gh api <path>`.
     func testClientCallSitesAreReadOnlyAndPartialFailuresKeepData() async throws {
         let recorder = RecordingRunner { args in
@@ -392,7 +450,10 @@ final class StatusRulesTests: XCTestCase {
         _ = try await client.selfHostedRunnerCount("o/r")
 
         XCTAssertEqual(snap.runners.map(\.name), ["w"])
-        XCTAssertEqual(snap.runs.map(\.run.id), [10], "the run whose jobs loaded is kept")
+        XCTAssertEqual(snap.runs.map(\.run.id), [10, 11], "a run whose jobs failed is kept")
+        XCTAssertNil(snap.runs.last?.jobs)
+        let dash = StatusRules.build(snapshots: [snap], logs: [:], seen: [], now: now)
+        XCTAssertTrue(dash.running.contains { $0.id == -11 && $0.name == "Jobs couldn't be loaded" })
         XCTAssertTrue(snap.runnersOK)
         XCTAssertNotNil(snap.error)
 
@@ -421,5 +482,14 @@ final class RecordingRunner: CommandRunning, @unchecked Sendable {
             return CommandResult(status: 0, stdout: Data(body.utf8), stderr: Data(), timedOut: false)
         }
         return CommandResult(status: 1, stdout: Data(), stderr: Data("HTTP 502".utf8), timedOut: false)
+    }
+}
+
+
+/// A runner whose commands never return (until the test process ends).
+final class HangingRunner: CommandRunning {
+    func run(_ executable: String, _ arguments: [String], timeout: TimeInterval) async throws -> CommandResult {
+        try await Task.sleep(for: .seconds(3600))
+        return CommandResult(status: 0, stdout: Data(), stderr: Data(), timedOut: false)
     }
 }

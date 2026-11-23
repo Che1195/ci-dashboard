@@ -35,8 +35,11 @@ struct MenuBarLabel: View {
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        Image(nsImage: StatusIcon.image(store.overall.level, refreshing: store.lastRefresh == nil))
-            .accessibilityLabel("CI status: \(StatusIcon.word(store.overall.level))")
+        // `store.clock` ticks every few seconds so queue-age thresholds change the colour between refreshes.
+        // (A TimelineView here sends the menu-bar host into an update loop.)
+        let level = store.overall(at: store.clock).level
+        Image(nsImage: StatusIcon.image(level, refreshing: store.lastRefresh == nil))
+            .accessibilityLabel("CI status: \(StatusIcon.word(level))")
             .task {
                 // `--open-window` opens the dashboard window at launch (handy for screenshots and for a
                 // login item that should show the window).

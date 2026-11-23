@@ -52,6 +52,12 @@ enum StatusRules {
         return jobLabels.allSatisfy { have.contains($0.lowercased()) }
     }
 
+    /// What a job needs, for people: its labels without `self-hosted`, e.g. "macos + arm64 + build".
+    static func requirement(_ labels: [String]) -> String {
+        let parts = Array(Set(labels.map { $0.lowercased() })).filter { $0 != "self-hosted" }.sorted()
+        return parts.isEmpty ? "self-hosted" : parts.joined(separator: " + ")
+    }
+
     static func asksForSelfHosted(_ labels: [String]) -> Bool {
         labels.contains { $0.caseInsensitiveCompare("self-hosted") == .orderedSame }
     }
@@ -90,7 +96,18 @@ enum StatusRules {
         for snap in snapshots {
             var running: [JobInfo] = []
             var queued: [JobInfo] = []
-            for (run, jobs) in snap.runs {
+            for (run, maybeJobs) in snap.runs {
+                guard let jobs = maybeJobs else {
+                    // GitHub returned the run but not its jobs: keep it, with what is known (its age and link).
+                    let placeholder = JobInfo(
+                        id: -run.id, repo: snap.repo, workflow: run.name ?? "Workflow",
+                        branch: run.head_branch ?? "", name: "Jobs couldn't be loaded", runnerName: nil,
+                        labels: [], createdAt: run.created_at,
+                        startedAt: run.status == "in_progress" ? (run.run_started_at ?? run.created_at) : nil,
+                        currentStep: nil, stepNumber: nil, stepCount: nil, url: run.html_url, isSelfHosted: false)
+                    if run.status == "in_progress" { running.append(placeholder) } else { queued.append(placeholder) }
+                    continue
+                }
                 if jobs.isEmpty, run.status == "queued" || run.status == "waiting" {
                     // A run GitHub hasn't created jobs for yet.
                     queued.append(JobInfo(
@@ -119,9 +136,13 @@ enum StatusRules {
                     state: runnerState(status: r.status, busy: r.busy, holding: log?.holding),
                     currentJob: running.first { $0.runnerName == r.name }, log: log, lastSeen: now))
             }
-            if snap.runnersOK && snap.runnersComplete {
+            // With an incomplete list, only remembered runners whose log says they're holding are shown, so that alert
+            // survives a failed GitHub read.
+            let listComplete = snap.runnersOK && snap.runnersComplete
+            do {
                 for s in seen where s.repo.lowercased() == snap.repo.lowercased() && !liveNames.contains(s.name)
-                    && now.timeIntervalSince(s.lastSeen) < rememberRunnersFor {
+                    && now.timeIntervalSince(s.lastSeen) < rememberRunnersFor
+                    && (listComplete || logs[s.name]?.holding == true) {
                     let log = logs[s.name]
                     rows.append(RunnerRow(
                         repo: snap.repo, name: s.name, os: s.os, labels: s.labels,
@@ -164,7 +185,7 @@ enum StatusRules {
                 }
                 let key = staffed ?? eligible.first ?? laneKey(job.labels)
                 lanes[key, default: Lane(repo: snap.repo, key: key, runners: [], queued: [])].queued.append(job)
-                if job.stranded { dash.stranded[laneKey(job.labels), default: 0] += 1 }
+                if job.stranded { dash.stranded[requirement(job.labels), default: 0] += 1 }
             }
 
             dash.running += running
