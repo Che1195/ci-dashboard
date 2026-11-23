@@ -42,6 +42,13 @@ struct LogSource: Codable, Hashable, Identifiable, Sendable {
     }
 }
 
+extension [LogSource] {
+    /// Equal row for row, comparing hosts and paths by their bytes (see `LogSource.readsLike`).
+    func readLike(_ other: [LogSource]) -> Bool {
+        count == other.count && zip(self, other).allSatisfy { $0.id == $1.id && $0.readsLike($1) }
+    }
+}
+
 struct AppSettings: Codable, Equatable, Sendable {
     static let refreshChoices = [15, 30, 60]
 
@@ -118,6 +125,25 @@ enum SettingsStore {
     }
 
     /// Confirmed holds survive a relaunch: a hold whose marker has scrolled out of the log must not come back green.
+    static let alertsKey = "activeAlerts.v1"
+
+    /// What is red now, and which of those were announced. Kept across launches so a relaunch neither repeats an
+    /// alert for a problem that stayed red nor misses that one cleared.
+    struct SavedAlerts: Codable, Equatable {
+        var active: [Alert] = []
+        var announced: [String] = []
+    }
+
+    static func loadAlerts(_ defaults: UserDefaults = .standard) -> SavedAlerts {
+        guard let data = defaults.data(forKey: alertsKey),
+              let a = try? JSONDecoder().decode(SavedAlerts.self, from: data) else { return SavedAlerts() }
+        return a
+    }
+
+    static func saveAlerts(_ a: SavedAlerts, _ defaults: UserDefaults = .standard) {
+        if let data = try? JSONEncoder().encode(a) { defaults.set(data, forKey: alertsKey) }
+    }
+
     static let holdsKey = "confirmedHolds.v1"
 
     static func loadHolds(_ defaults: UserDefaults = .standard) -> [String: Date] {

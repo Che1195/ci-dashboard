@@ -6,9 +6,12 @@ import Observation
 final class DashboardStore {
     var settings: AppSettings {
         didSet {
-            guard settings != oldValue else { return }
+            let sourcesChanged = !settings.logSources.readLike(oldValue.logSources)
+            guard settings != oldValue || sourcesChanged else { return }
             SettingsStore.save(settings, defaults)
-            if settings.repos != oldValue.repos || settings.logSources != oldValue.logSources
+            // What is watched changed: a problem that drops out because of it didn't end, so it goes quietly.
+            if settings.repos != oldValue.repos || sourcesChanged { quietClears = true }
+            if settings.repos != oldValue.repos || sourcesChanged
                 || settings.ghPath != oldValue.ghPath || settings.disabledRunners != oldValue.disabledRunners {
                 settingsGeneration += 1
                 Task { await refresh() }
@@ -47,8 +50,12 @@ final class DashboardStore {
     /// Where settings, remembered runners and holds are kept (a test passes its own, never the app's).
     private let defaults: UserDefaults
 
-    /// Problems already notified, by key, so each notifies once when it appears and once when it clears.
-    private var activeAlerts: [String: Alert] = [:]
+    /// Problems red at the last refresh, by key, so each notifies once when it appears and once when it clears.
+    private var activeAlerts: [String: Alert]
+    /// The active problems whose opening notification was posted; only those say when they clear.
+    private var announced: Set<String>
+    /// Set when the watched repos or log sources change; the next refresh retires vanished problems silently.
+    private var quietClears = false
     private let notifier: Notifying
     private static var underTests: Bool { ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil }
 
@@ -62,6 +69,10 @@ final class DashboardStore {
         settings = loaded
         seen = SettingsStore.loadSeen(defaults)
         confirmedHolds = SettingsStore.loadHolds(defaults)
+        let saved = SettingsStore.loadAlerts(defaults)
+        let active = Dictionary(saved.active.map { ($0.key, $0) }, uniquingKeysWith: { a, _ in a })
+        activeAlerts = active
+        announced = Set(saved.announced).intersection(active.keys)
         // Holds the last run saved show from the first frame, not only once the first refresh has finished.
         dashboard = StatusRules.restoredDashboard(
             holds: confirmedHolds, sources: loaded.logSources, repos: loaded.repos, seen: seen, now: Date())
@@ -176,7 +187,9 @@ final class DashboardStore {
         updateSeen(snapshots, now: now)
         dashboard = StatusRules.build(snapshots: snapshots, logs: sticky.logs, seen: seen, now: now,
                                       disabled: Set(settings.disabledRunners))
-        notifyChanges(now: now)
+        // GitHub-based problems may only be judged gone when every repo was read in full.
+        let githubComplete = ghClient != nil && snapshots.allSatisfy { $0.error == nil && $0.runnersOK }
+        notifyChanges(now: now, githubComplete: githubComplete)
         rateLimit = rateCore
         lastRefresh = now
     }
@@ -202,22 +215,19 @@ final class DashboardStore {
         }
     }
 
-    /// Notifies problems that appeared since the last refresh, and holds or stuck jobs that cleared. Tracked even
-    /// while notifications are off, so turning them on doesn't replay what is already red.
-    private func notifyChanges(now: Date) {
-        var current = AlertRules.alerts(dashboard, now: now)
-        // A global error (gh missing, GitHub unreachable) can hide GitHub-based problems without ending them: keep
-        // those as they were. Holds come from the logs, which are still read, so they follow the logs.
-        if globalError != nil {
-            let keys = Set(current.map(\.key))
-            current += activeAlerts.values.filter { !keys.contains($0.key) && !$0.key.hasPrefix("hold:") }
-                .sorted { $0.key < $1.key }
-        }
-        let (raised, cleared) = AlertRules.changes(previous: activeAlerts, current: current)
-        activeAlerts = Dictionary(current.map { ($0.key, $0) }, uniquingKeysWith: { a, _ in a })
-        guard settings.notify else { return }
-        for alert in raised { notifier.post(alert, cleared: false) }
-        for alert in cleared { notifier.post(alert, cleared: true) }
+    /// Notifies problems that appeared since the last refresh, and those that cleared (see `AlertRules.step`).
+    private func notifyChanges(now: Date, githubComplete: Bool) {
+        let step = AlertRules.step(
+            previous: activeAlerts, announced: announced, found: AlertRules.alerts(dashboard, now: now),
+            githubComplete: githubComplete, quiet: quietClears,
+            sourced: Set(settings.logSources.map(\.runnerName)), notify: settings.notify)
+        quietClears = false
+        activeAlerts = step.active
+        announced = step.announced
+        for post in step.posts { notifier.post(post.alert, cleared: post.cleared) }
+        let save = SettingsStore.SavedAlerts(active: activeAlerts.values.sorted { $0.key < $1.key },
+                                             announced: announced.sorted())
+        if save != SettingsStore.loadAlerts(defaults) { SettingsStore.saveAlerts(save, defaults) }
     }
 
     /// Marks a runner as parked on purpose, or not.

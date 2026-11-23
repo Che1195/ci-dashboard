@@ -1046,10 +1046,72 @@ final class StatusRulesTests: XCTestCase {
         let store = DashboardStore(commandRunner: runner, defaults: defaults, notifier: notifier)
         for _ in 0..<3 { await store.refresh() }
         XCTAssertEqual(notifier.posted.map { "\($0.alert.key) \($0.cleared)" }, ["hold:mac false", "hold:mac true"])
+    }
 
-        store.settings.notify = false
-        SettingsStore.saveHolds(["mac": now], defaults)
-        XCTAssertEqual(notifier.posted.count, 2)
+    @MainActor
+    func testRelaunchNeitherRepeatsNorLosesAHold() async throws {
+        let suite = "io.github.che1195.CIDashboard.tests"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
+        var settings = AppSettings()
+        settings.logSources = [source("mac", host: "h")]
+        SettingsStore.save(settings, defaults)
+        let first = SilentNotifier()
+        let holding = GatedRunner { _ in "cleanup failed\n" }
+        holding.open()
+        await DashboardStore(commandRunner: holding, defaults: defaults, notifier: first).refresh()
+        XCTAssertEqual(first.posted.count, 1)
+        // Relaunched while the hold goes on: nothing new. Then it clears: that is said.
+        let second = SilentNotifier()
+        let relaunched = DashboardStore(commandRunner: GatedRunner { $0 < 2 ? "cleanup failed\n" : "cleanup succeeded\n" }
+            .opened(), defaults: defaults, notifier: second)
+        await relaunched.refresh()
+        XCTAssertTrue(second.posted.isEmpty, "a hold that stayed red isn't announced again")
+        await relaunched.refresh()
+        XCTAssertEqual(second.posted.map { "\($0.alert.key) \($0.cleared)" }, ["hold:mac true"])
+    }
+
+    @MainActor
+    func testMutedProblemsNeverNotifyEvenAfterUnmuting() async throws {
+        let suite = "io.github.che1195.CIDashboard.tests"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
+        var settings = AppSettings()
+        settings.logSources = [source("mac", host: "h")]
+        settings.notify = false
+        SettingsStore.save(settings, defaults)
+        let notifier = SilentNotifier()
+        let store = DashboardStore(
+            commandRunner: GatedRunner { $0 < 3 ? "cleanup failed\n" : "cleanup succeeded\n" }.opened(),
+            defaults: defaults, notifier: notifier)
+        await store.refresh()
+        XCTAssertTrue(notifier.posted.isEmpty, "muted: the hold isn't announced")
+        store.settings.notify = true
+        await store.refresh()
+        XCTAssertTrue(notifier.posted.isEmpty, "unmuting doesn't replay a hold that is already red")
+        await store.refresh()
+        XCTAssertTrue(notifier.posted.isEmpty, "a clear is said only for a hold that was announced")
+    }
+
+    func testRecoveriesNeedEvidence() {
+        let hold = AlertRules.alerts(holdingDash(["mac"]), now: now)[0]
+        let stuck = AlertRules.alerts(holdingDash([], stranded: ["macos": 1]), now: now)[0]
+        let previous = [hold.key: hold, stuck.key: stuck]
+        let announced: Set<String> = [hold.key, stuck.key]
+        func step(complete: Bool = true, quiet: Bool = false, sourced: Set<String> = ["mac"]) -> [String] {
+            AlertRules.step(previous: previous, announced: announced, found: [], githubComplete: complete,
+                            quiet: quiet, sourced: sourced, notify: true).posts.map { "\($0.alert.key) \($0.cleared)" }
+        }
+        XCTAssertEqual(step(), ["hold:mac true", "stranded:macos true"])
+        XCTAssertEqual(step(complete: false), ["hold:mac true"], "an incomplete GitHub read keeps stuck jobs red")
+        let kept = AlertRules.step(previous: previous, announced: announced, found: [], githubComplete: false,
+                                   quiet: false, sourced: ["mac"], notify: true)
+        XCTAssertNotNil(kept.active[stuck.key])
+        XCTAssertTrue(kept.announced.contains(stuck.key), "so the next good read doesn't announce it again")
+        XCTAssertEqual(step(quiet: true), [], "watching less isn't a recovery")
+        XCTAssertEqual(step(sourced: []), ["stranded:macos true"], "a hold whose log source went isn't a recovery")
     }
 
     func testDisabledRunnerShowsDisabledOnlyWhileOffline() {
@@ -1105,6 +1167,7 @@ final class GatedRunner: CommandRunning, @unchecked Sendable {
     private let log: @Sendable (Int) -> String
 
     init(_ log: @escaping @Sendable (Int) -> String) { self.log = log }
+    func opened() -> GatedRunner { open(); return self }
     var sshCalls: Int { lock.withLock { _sshCalls } }
     func open() { lock.withLock { isOpen = true } }
 

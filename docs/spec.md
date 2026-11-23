@@ -72,9 +72,17 @@ Rate-limit remaining is shown in the footer.
 
 ## Notifications (v1.1)
 A runner holding, jobs no online runner can take (per label set), and a job queued over 10 min each notify once
-when they start. A hold or stranded label set notifies again when it clears; a drained queue doesn't. While GitHub
-can't be read, GitHub-based problems keep their state (no false "cleared"); holds follow the logs, which are still
-read. Settings → General has the switch (on by default) and **Launch at login** (`SMAppService`).
+when they start. A hold or stranded label set notifies again when it clears; a drained queue doesn't. A recovery is
+announced only when it was seen: GitHub-based problems stay red while any repo's read is incomplete (failed, cut off,
+or no `gh`); a hold's clear needs its log source still to exist; problems that vanish because the watched repos or
+log sources changed go quietly; and only problems whose opening was announced say when they clear (nothing raised
+while notifications were off). What is red, and what was announced, is saved, so a relaunch neither repeats nor
+misses one. Notifications wait for macOS's permission answer. Settings → General has the switch (on by default) and
+**Launch at login** (`SMAppService`; re-read whenever the app or window becomes active).
+
+Accepted limits: a notification macOS fails to schedule isn't retried; a hold that starts and clears between two
+refreshes, or a queue that crosses 10 minutes and drains between two refreshes, isn't announced; a real clear in the
+same refresh as an edit to the watched repos or log sources goes quietly.
 
 ## Exclusions
 History charts, GitHub-hosted runner detail, organisation-level runners, any write action.

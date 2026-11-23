@@ -1,3 +1,4 @@
+import AppKit
 import ServiceManagement
 import SwiftUI
 
@@ -95,7 +96,7 @@ private struct LogSettings: View {
     @State private var drafts: [LogSource.ID: LogSource] = [:]
 
     private func saved(_ id: LogSource.ID) -> LogSource? { store.settings.logSources.first { $0.id == id } }
-    private func hasDraft(_ source: LogSource) -> Bool { drafts[source.id].map { $0 != source } ?? false }
+    private func hasDraft(_ source: LogSource) -> Bool { drafts[source.id].map { !$0.readsLike(source) } ?? false }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -107,8 +108,9 @@ private struct LogSettings: View {
                     ForEach(store.settings.logSources) { source in
                         VStack(alignment: .leading) {
                             Text(source.runnerName.isEmpty ? "New runner log" : source.runnerName)
-                            Text((source.host.isEmpty ? "This Mac" : source.host) + (hasDraft(source) ? " · not saved" : ""))
-                                .font(.caption).foregroundStyle(hasDraft(source) ? Color.orange : Color.secondary)
+                            let flag = hasDraft(source) ? " · not saved" : (source.saveProblem != nil ? " · needs a fix" : "")
+                            Text((source.host.isEmpty ? "This Mac" : source.host) + flag)
+                                .font(.caption).foregroundStyle(flag.isEmpty ? Color.secondary : Color.orange)
                         }
                         .tag(source.id)
                     }
@@ -126,6 +128,8 @@ private struct LogSettings: View {
                                 drafts[id] = nil
                             },
                             revert: { drafts[id] = nil })
+                        // A fresh editor per row, so no text field's in-progress edit can carry over to another row.
+                        .id(id)
                     } else {
                         Text("Select or add a runner log.").foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -162,7 +166,7 @@ private struct LogSourceEditor: View {
 
     var body: some View {
         let problem = draft.saveProblem
-        let changed = draft != source
+        let changed = !draft.readsLike(source)
         Form {
             TextField("Runner name", text: $draft.runnerName, prompt: Text("exactly as GitHub shows it"))
             TextField("SSH host", text: $draft.host, prompt: Text("empty = a file on this Mac"))
@@ -173,7 +177,7 @@ private struct LogSourceEditor: View {
                 .font(.caption).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             HStack {
-                if let problem, changed {
+                if let problem {
                     Text(problem).font(.caption).foregroundStyle(.red)
                 } else if changed {
                     Text("Not saved").font(.caption).foregroundStyle(.secondary)
@@ -215,6 +219,10 @@ private struct GeneralSettings: View {
                     Button("Open") { SMAppService.openSystemSettingsLoginItems() }
                 }
             }
+            if loginStatus == .notFound {
+                Text("macOS can't find this app as a login item. Move it to Applications and try again.")
+                    .font(.caption).foregroundStyle(.red)
+            }
             if let loginError { Text(loginError).font(.caption).foregroundStyle(.red) }
             Toggle("Notify when something goes red", isOn: $store.settings.notify)
             Text("A runner holding, jobs no runner can take, or a job queued over 10 minutes. Each notifies once, and again when a hold or stuck job clears.")
@@ -232,5 +240,12 @@ private struct GeneralSettings: View {
         }
         .formStyle(.grouped)
         .onAppear { loginStatus = SMAppService.mainApp.status }
+        // Approving or removing the login item happens in System Settings: re-read it when you come back.
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            loginStatus = SMAppService.mainApp.status
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in
+            loginStatus = SMAppService.mainApp.status
+        }
     }
 }
