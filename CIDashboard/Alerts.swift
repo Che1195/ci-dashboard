@@ -32,10 +32,11 @@ enum AlertRules {
         func repos(_ jobs: [JobInfo]) -> Alert.Scope { .repos(Set(jobs.map { $0.repo.lowercased() }).sorted()) }
         for (needs, count) in dash.stranded.sorted(by: { $0.key < $1.key }) {
             let jobs = dash.queued.filter { $0.stranded && StatusRules.requirement($0.labels) == needs }
-            // "Cleared" says only what a read can show: the jobs may have run, or been cancelled.
+            // No "cleared" for these: a read can't tell whether a runner came back, the jobs were cancelled, or a
+            // settings change only hid them, so it says nothing rather than something that may be untrue.
             out.append(Alert(key: "stranded:\(needs)", title: "No runner can take jobs needing \(needs)",
                              body: "\(count) queued, and no runner online has those labels.",
-                             clearedTitle: "No jobs are waiting on \(needs) now", scope: repos(jobs)))
+                             clearedTitle: nil, scope: repos(jobs)))
         }
         let late = dash.queued.filter { now.timeIntervalSince($0.createdAt) > StatusRules.queuedAlarmAfter }
         if let oldest = late.min(by: { $0.createdAt < $1.createdAt }) {
@@ -165,8 +166,8 @@ protocol Notifying: AnyObject {
     /// that prompt, so openings that waited for it can be sent.
     func prepare(_ answered: @escaping @MainActor () async -> Void)
     /// Hands one notification to macOS. True once macOS has accepted it; false when it can't be shown now
-    /// (permission not answered yet, denied, or scheduling failed).
-    func post(_ alert: Alert, cleared: Bool) async -> Bool
+    /// (permission not answered yet, denied, scheduling failed, or `stillWanted` said no just before submitting).
+    func post(_ alert: Alert, cleared: Bool, stillWanted: @escaping @MainActor () -> Bool) async -> Bool
 }
 
 /// Delivers alerts as macOS notifications.
@@ -193,11 +194,13 @@ final class UserNotifier: Notifying {
         }
     }
 
-    func post(_ alert: Alert, cleared: Bool) async -> Bool {
+    func post(_ alert: Alert, cleared: Bool, stillWanted: @escaping @MainActor () -> Bool) async -> Bool {
         let center = UNUserNotificationCenter.current()
         // Asked every time, never cached: permission can be given or taken away in System Settings at any moment.
         let status = await center.notificationSettings().authorizationStatus
         guard status == .authorized || status == .provisional else { return false }
+        // The app's own switch, or what is watched, may have changed while macOS was asked.
+        guard stillWanted() else { return false }
         let content = UNMutableNotificationContent()
         content.title = cleared ? (alert.clearedTitle ?? alert.title) : alert.title
         content.body = cleared ? "" : alert.body
@@ -237,10 +240,10 @@ final class SilentNotifier: Notifying {
 
     func prepare(_ answered: @escaping @MainActor () async -> Void) { self.answered = answered }
 
-    func post(_ alert: Alert, cleared: Bool) async -> Bool {
+    func post(_ alert: Alert, cleared: Bool, stillWanted: @escaping @MainActor () -> Bool) async -> Bool {
         whileAsked?()
         if stuck { await withCheckedContinuation { unanswered.append($0) } }
-        guard delivers else { return false }
+        guard delivers, stillWanted() else { return false }
         posted.append((alert, cleared))
         return true
     }

@@ -15,6 +15,12 @@ final class DashboardStore {
                 Task { await refresh() }
             }
             if settings.notify && !oldValue.notify { askPermission() }
+            if !settings.notify && oldValue.notify {
+                // Openings waiting for macOS are dropped for good, so switching back on can't replay them.
+                pendingOpenings = []
+                saveAlerts()
+            }
+            if settings.repos != oldValue.repos { forgetUnwatchedRepos() }
             if settings.refreshSeconds != oldValue.refreshSeconds || settings.hourlyDiscovery != oldValue.hourlyDiscovery {
                 startLoops()
             }
@@ -184,9 +190,15 @@ final class DashboardStore {
         // logs showed is kept (above), so it is announced too: a hold read here and cleared by the next read would
         // otherwise never be said. Every confirmed hold counts; GitHub-based problems stay as they were.
         guard settingsCurrent else {
-            await updateAlerts(
-                found: AlertRules.holdAlerts(Array(confirmedHolds.keys), sources: settings.logSources),
-                githubComplete: false)
+            // Only a hold read from a source that is still exactly as it was can be attributed to that source. A
+            // hold whose source was edited keeps the alert it already had (if any), untouched.
+            let unchanged = Set(sources.filter { read in settings.logSources.contains { $0.readsLike(read) } }
+                .map(\.runnerName))
+            let found = AlertRules.holdAlerts(confirmedHolds.keys.filter(unchanged.contains), sources: settings.logSources)
+                + activeAlerts.values.filter { alert in
+                    AlertRules.holdRunner(alert.key).map { confirmedHolds[$0] != nil && !unchanged.contains($0) } ?? false
+                }.sorted { $0.key < $1.key }
+            await updateAlerts(found: found, githubComplete: false)
             refreshAgain = true
             return
         }
@@ -262,16 +274,24 @@ final class DashboardStore {
     private func deliver(cleared: [Alert]) async {
         // An opening counts as announced only once macOS has accepted it. The switch is read again each time: it
         // can be turned off while macOS is being asked.
+        // Each item is checked again just before it is sent (and inside `post`, after macOS answers about
+        // permission): a newer refresh or a settings edit may have changed things while an earlier one was sent.
         for key in pendingOpenings where sighted.contains(key) {
-            guard settings.notify, let alert = activeAlerts[key] else { continue }
-            guard await notifier.post(alert, cleared: false) else { continue }
+            guard stillWanted(key, cleared: false), let alert = activeAlerts[key] else { continue }
+            let sent = await notifier.post(alert, cleared: false) { [weak self] in
+                self?.stillWanted(key, cleared: false) ?? false
+            }
+            // Counted only if this is still the same waiting opening (an edit meanwhile may have dropped it).
+            guard sent, pendingOpenings.contains(key), activeAlerts[key] != nil else { continue }
             pendingOpenings.removeAll { $0 == key }
             announced.insert(key)
             saveAlerts()
         }
         // Each of these had its opening accepted in an earlier refresh, so an opening always comes first.
-        for alert in cleared where settings.notify {
-            _ = await notifier.post(alert, cleared: true)
+        for alert in cleared where stillWanted(alert.key, cleared: true) {
+            _ = await notifier.post(alert, cleared: true) { [weak self] in
+                self?.stillWanted(alert.key, cleared: true) ?? false
+            }
         }
     }
 
@@ -282,6 +302,42 @@ final class DashboardStore {
         let timer = Task { try? await Task.sleep(for: limit); end.finish() }
         for await _ in ended {}
         timer.cancel()
+    }
+
+    /// Narrows each GitHub-based problem to the repos still watched, at the moment of the edit, and forgets one
+    /// left with none, so neither a refresh in flight nor re-adding the repo later revives it (or its "announced").
+    private func forgetUnwatchedRepos() {
+        let watched = Set(settings.repos.map { $0.lowercased() })
+        for (key, alert) in activeAlerts {
+            guard case .repos(let list)? = alert.scope else { continue }
+            let kept = list.filter(watched.contains)
+            if kept.isEmpty {
+                activeAlerts[key] = nil
+                announced.remove(key)
+                pendingOpenings.removeAll { $0 == key }
+            } else if kept != list {
+                activeAlerts[key]?.scope = .repos(kept)
+            }
+        }
+        saveAlerts()
+    }
+
+    /// Whether a notification about `key` still makes sense right now: notifications on, the problem still being
+    /// tracked and watched, and (for an opening) still red on the dashboard; (for a clear) not red again.
+    private func stillWanted(_ key: String, cleared: Bool) -> Bool {
+        guard settings.notify else { return false }
+        let redNow = currentAlertKeys().contains(key)
+        if cleared { return !redNow }
+        guard pendingOpenings.contains(key), let alert = activeAlerts[key], redNow else { return false }
+        guard alert.scope != nil else { return true }
+        return AlertRules.watchedScope(alert, repos: Set(settings.repos.map { $0.lowercased() }),
+                                       readable: LogReader.uniqueSources(settings.logSources)) != nil
+    }
+
+    /// What is red on the dashboard now, holds included (also ones a stale refresh kept but didn't show).
+    private func currentAlertKeys() -> Set<String> {
+        Set(AlertRules.alerts(dashboard, sources: settings.logSources, now: Date()).map(\.key))
+            .union(confirmedHolds.keys.map { "hold:\($0)" })
     }
 
     private func saveAlerts() {

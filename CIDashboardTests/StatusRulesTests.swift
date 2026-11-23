@@ -1041,7 +1041,7 @@ final class StatusRulesTests: XCTestCase {
         XCTAssertEqual(alerts[1].scope, .source(mac))
         XCTAssertEqual(alerts[2].scope, .repos(["o/a", "o/b"]), "the repos with stuck jobs, lowercased")
         XCTAssertEqual(alerts[3].scope, .repos(["o/r"]), "only the repo whose job is over 10 minutes")
-        XCTAssertEqual(alerts[2].clearedTitle, "No jobs are waiting on macos now")
+        XCTAssertNil(alerts[2].clearedTitle, "stuck jobs say nothing when they stop being stuck")
     }
 
     /// Runs `AlertRules.step` refresh after refresh, playing macOS's part: `accepts` says whether an opening handed
@@ -1098,7 +1098,7 @@ final class StatusRulesTests: XCTestCase {
             book.refresh([], complete: complete)
             return book
         }
-        XCTAssertEqual(after { _ in }.sent, ["hold:mac cleared", "stranded:macos cleared"])
+        XCTAssertEqual(after { _ in }.sent, ["hold:mac cleared"], "stuck jobs say nothing when they stop being stuck")
 
         // An incomplete GitHub read keeps stuck jobs red, and announced, so the next good read doesn't repeat them.
         let kept = after(complete: false) { _ in }
@@ -1107,17 +1107,18 @@ final class StatusRulesTests: XCTestCase {
         XCTAssertTrue(kept.announced.contains("stranded:macos"))
 
         // A hold's clear counts only from the log source that showed the hold.
-        XCTAssertEqual(after { $0.sources = [] }.sent, ["stranded:macos cleared"], "its log source went")
-        XCTAssertEqual(after { $0.sources = [self.source("mac", path: "/other")] }.sent, ["stranded:macos cleared"],
+        XCTAssertEqual(after { $0.sources = [] }.sent, [], "its log source went")
+        XCTAssertEqual(after { $0.sources = [self.source("mac", path: "/other")] }.sent, [],
                        "another file says nothing about the hold this one showed")
-        XCTAssertEqual(after { $0.sources[0].clearPattern = "cleanup succeeded|" }.sent, ["stranded:macos cleared"])
+        XCTAssertEqual(after { $0.sources[0].clearPattern = "cleanup succeeded|" }.sent, [])
         var movedRow = mac; movedRow.id = UUID()
-        XCTAssertEqual(after { $0.sources = [movedRow] }.sent, ["hold:mac cleared", "stranded:macos cleared"],
+        XCTAssertEqual(after { $0.sources = [movedRow] }.sent, ["hold:mac cleared"],
                        "the same source in a new row is the same source")
         // Stuck jobs in a repo that is no longer watched didn't recover.
         XCTAssertEqual(after { $0.repos = ["o/b"] }.sent, ["hold:mac cleared"])
-        XCTAssertEqual(after { $0.repos = ["O/A"] }.sent, ["hold:mac cleared", "stranded:macos cleared"],
-                       "repo names ignore case")
+        let caseOnly = after { $0.repos = ["O/A"] }
+        XCTAssertEqual(caseOnly.sent, ["hold:mac cleared"])
+        XCTAssertNil(caseOnly.active["stranded:macos"], "repo names ignore case: still watched, so it ended normally")
     }
 
     /// High 1: unwatching the repo whose jobs were stuck must never be told as a recovery, however the next reads
@@ -1139,7 +1140,8 @@ final class StatusRulesTests: XCTestCase {
         book.refresh([], complete: false)
         XCTAssertEqual(book.active["stranded:macos"]?.scope, .repos(["o/b"]))
         book.refresh([], complete: true)
-        XCTAssertEqual(book.sent, ["stranded:macos opened", "stranded:macos cleared"])
+        XCTAssertEqual(book.sent, ["stranded:macos opened"], "stuck jobs say nothing when they stop being stuck")
+        XCTAssertTrue(book.active.isEmpty)
 
         // A repo that couldn't be read keeps its part of the problem, so unwatching the other one doesn't end it.
         book = AlertBook()
@@ -1236,6 +1238,69 @@ final class StatusRulesTests: XCTestCase {
     @MainActor
     func sent(_ notifier: SilentNotifier) -> [String] {
         notifier.posted.map { "\($0.alert.key) \($0.cleared ? "cleared" : "opened")" }
+    }
+
+    /// Round 3: switching notifications off and back on with no refresh in between must not replay an opening
+    /// that was waiting for permission.
+    @MainActor
+    func testOffAndOnWithoutARefreshDropsTheWaitingOpening() async throws {
+        let defaults = try freshDefaults()
+        defer { forget(defaults) }
+        var settings = AppSettings()
+        settings.logSources = [source("mac", host: "h")]
+        let notifier = SilentNotifier()
+        notifier.delivers = false   // permission not given yet
+        let store = alertStore(defaults, settings, runner: GatedRunner { _ in "cleanup failed\n" }.opened(),
+                               notifier: notifier)
+        await store.refresh()
+        XCTAssertEqual(SettingsStore.loadAlerts(defaults).pending, ["hold:mac"])
+        store.settings.notify = false
+        XCTAssertEqual(SettingsStore.loadAlerts(defaults).pending, [], "dropped at the moment of the switch")
+        store.settings.notify = true
+        notifier.delivers = true
+        await store.refresh()
+        XCTAssertEqual(sent(notifier), [], "the hold was red before the switch went off: not replayed")
+    }
+
+    /// Round 3: unwatching a repo forgets its stuck-jobs problem at the moment of the edit, so re-adding the repo
+    /// makes a fresh problem rather than inheriting the old one's "announced".
+    @MainActor
+    func testUnwatchThenReAddStartsAFreshProblem() async throws {
+        let defaults = try freshDefaults()
+        defer { forget(defaults) }
+        var settings = AppSettings()
+        settings.repos = ["o/a"]
+        settings.ghPath = "/usr/bin/true"
+        let ci = FakeCI(stuck: ["o/a"])
+        let notifier = SilentNotifier()
+        let store = alertStore(defaults, settings, runner: ci, notifier: notifier)
+        await store.refresh()
+        XCTAssertEqual(sent(notifier), ["stranded:macos opened"])
+        store.settings.repos = []
+        XCTAssertEqual(SettingsStore.loadAlerts(defaults).active, [], "forgotten at once, before any refresh")
+        XCTAssertEqual(SettingsStore.loadAlerts(defaults).announced, [])
+        store.settings.repos = ["o/a"]
+        await store.refresh()
+        XCTAssertEqual(sent(notifier), ["stranded:macos opened", "stranded:macos opened"])
+    }
+
+    /// Round 3: each waiting opening is checked again just before it goes out. A log source removed while macOS
+    /// is asked about the first hold means the second hold's opening isn't sent.
+    @MainActor
+    func testEachOpeningIsRecheckedJustBeforeItIsSent() async throws {
+        let defaults = try freshDefaults()
+        defer { forget(defaults) }
+        var settings = AppSettings()
+        settings.logSources = [source("mac", host: "h"), source("mini", host: "h")]
+        let notifier = SilentNotifier()
+        let store = alertStore(defaults, settings, runner: GatedRunner { _ in "cleanup failed\n" }.opened(),
+                               notifier: notifier)
+        notifier.whileAsked = {
+            store.settings.logSources.removeAll { $0.runnerName == "mini" }
+            notifier.whileAsked = nil
+        }
+        await store.refresh()
+        XCTAssertEqual(sent(notifier), ["hold:mac opened"], "mini's log is no longer watched")
     }
 
     @MainActor
@@ -1341,8 +1406,9 @@ final class StatusRulesTests: XCTestCase {
                                notifier: notifier)
         notifier.whileAsked = { store.settings.notify = false }
         await store.refresh()
-        XCTAssertEqual(sent(notifier), ["hold:mac opened"], "the one macOS was already being asked about")
-        XCTAssertEqual(SettingsStore.loadAlerts(defaults).announced, ["hold:mac"])
+        XCTAssertEqual(sent(notifier), [], "turned off while macOS was asked: not even that one is sent")
+        XCTAssertEqual(SettingsStore.loadAlerts(defaults).announced, [])
+        XCTAssertEqual(SettingsStore.loadAlerts(defaults).pending, [], "and nothing waits to replay")
     }
 
     /// An opening that was still waiting is sent only for a problem the latest read shows: not for one merely
@@ -1522,7 +1588,8 @@ final class StatusRulesTests: XCTestCase {
         ci.stuck = []
         let third = SilentNotifier()
         await DashboardStore(commandRunner: ci, defaults: defaults, notifier: third).refresh()
-        XCTAssertEqual(sent(third), ["stranded:macos cleared"])
+        XCTAssertEqual(sent(third), [], "stuck jobs say nothing when they stop being stuck")
+        XCTAssertEqual(SettingsStore.loadAlerts(defaults).active, [])
     }
 
     /// A log source removed and the app quit before a refresh: the saved hold's clear is never announced, because

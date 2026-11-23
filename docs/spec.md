@@ -72,20 +72,22 @@ Rate-limit remaining is shown in the footer.
 
 ## Notifications (v1.1)
 A runner holding, jobs no online runner can take (per label set), and a job queued over 10 min each notify once
-when they start. A hold or stranded label set notifies again when it clears ("<runner> is no longer holding", "No
-jobs are waiting on <labels> now": the jobs may have run or been cancelled); a drained queue doesn't. Settings →
+when they start. Only a hold notifies again when it clears ("<runner> is no longer holding"), because only a hold
+ends on positive evidence (a clear line in its log). Stuck jobs and a long queue end silently: a GitHub read can't
+tell whether a runner came back, the jobs were cancelled, or a settings change only hid them. Settings →
 General has the switch (on by default) and **Launch at login** (`SMAppService`; re-read whenever the app or window
 becomes active). Notifications also show while the app itself is frontmost.
 
-**A recovery is announced only when it was seen, for a problem that is still watched.**
+**A hold's recovery is announced only when it was seen, from the log that showed it.**
 - GitHub-based problems stay red while any repo's read is incomplete (failed, cut off, or no `gh`).
 - Each problem is saved with its scope: for stuck jobs and a long queue, the watched repos whose jobs show it; for a
   hold, the log source (host, path, both patterns) that showed it. A repo that is no longer watched drops out of the
-  scope, and a problem left with none of its repos is forgotten at once, without a word, even on an incomplete read
-  (the same trouble in another repo later is a new problem and opens again). A hold's clear is announced only when
+  scope at the moment of the settings edit, and a problem left with none of its repos is forgotten then, without a
+  word (re-adding the repo later, or the same trouble in another repo, is a new problem and opens again). A hold's clear is announced only when
   it is read from the same log source that showed the hold; if that source was removed or edited, the hold ends
   silently. Because the scope is saved, none of this depends on which refresh comes next or on a relaunch.
-- A hold seen by a refresh whose GitHub half was dropped (a setting changed meanwhile) is still announced.
+- A hold seen by a refresh whose GitHub half was dropped (a setting changed meanwhile) is still announced, but only
+  when its log source is unchanged; a hold whose source was edited meanwhile keeps the alert it had.
 
 **An opening counts only once macOS has accepted it.** A new problem's opening waits in a saved list until macOS
 takes the notification; only then is it recorded as announced, and only announced problems say when they clear. So
@@ -95,8 +97,10 @@ wait: answering the prompt, a later grant in System Settings, or the next launch
 is still on the dashboard (seen by the latest read, not merely kept through an incomplete one). A problem that ends
 while its opening waits ends silently. Turning the switch off drops waiting openings for good; problems are still
 tracked while it is off, so turning it on doesn't replay what is already red, and nothing raised while it was off
-says when it clears. What is red, what was announced and what is waiting are saved, so a relaunch neither repeats
-nor misses one.
+says when it clears. Each notification is checked again just before it is sent (switch on, problem still tracked,
+watched and red on the dashboard; a clear only if it isn't red again), and once more after macOS answers about
+permission. What is red, what was announced and what is waiting are saved, so a relaunch neither repeats nor misses
+one.
 
 The dashboard never waits on macOS for more than 2 s: if it doesn't answer for a notification, refreshes carry on
 and the alert bookkeeping stands still until it does.
@@ -109,12 +113,12 @@ Accepted limits:
   refreshes, isn't announced.
 - A hold whose log source is edited while it is red (even to fix a pattern) ends without a "cleared", as does one
   announced by a version that saved no scope.
-- Stuck jobs in two repos share one notification per label set: after one of the repos is unwatched, "No jobs are
-  waiting…" is said when the other's are gone, and speaks only for watched repos.
 - GitHub's run lists are five separate requests per repo. A run that changes state between two of them can be
-  missing from both although every request succeeded; if it was the only stuck job for its labels, that read looks
-  like a recovery: "No jobs are waiting…" is said, and the next read opens the problem again. The app doesn't wait
-  for a second read before believing a complete one.
+  missing from both although every request succeeded; if it was the only stuck job for its labels, that read ends
+  the problem (silently) and the next read opens it again. The app doesn't wait for a second read before believing a
+  complete one.
+- A hold saved by a build before v1.1, with no alert yet, takes the scope of the runner's log source at its first
+  refresh with unchanged settings, even if a different source showed it.
 
 ## Exclusions
 History charts, GitHub-hosted runner detail, organisation-level runners, any write action.
