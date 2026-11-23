@@ -225,7 +225,7 @@ private struct GeneralSettings: View {
             }
             if let loginError { Text(loginError).font(.caption).foregroundStyle(.red) }
             Toggle("Notify when something goes red", isOn: $store.settings.notify)
-            Text("A runner holding, jobs no runner can take, or a job queued over 10 minutes. Each notifies once, and again when a hold or stuck job clears.")
+            Text("A runner holding, jobs no runner can take, or a job queued over 10 minutes. Each notifies once; a holding runner notifies again when its log shows it cleared.")
                 .font(.caption).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             Picker("Refresh every", selection: $store.settings.refreshSeconds) {

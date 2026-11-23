@@ -120,8 +120,10 @@ enum AlertRules {
         for var alert in found where active[alert.key] == nil {
             if let old = previous[alert.key] {
                 if holdRunner(alert.key) != nil {
-                    // A hold keeps the source that first showed it.
-                    alert.scope = old.scope
+                    // An announced hold keeps the source that showed it, the only one whose clear line proves it
+                    // ended. One not yet announced follows the source that shows it now, so editing that log while
+                    // its opening waits for permission doesn't strand the opening.
+                    if announced.contains(alert.key) || alert.scope == nil { alert.scope = old.scope }
                 } else if !githubComplete {
                     // A repo that couldn't be read now may still have its part of the problem.
                     if case .repos(let before)? = stillWatched(old), case .repos(let now)? = alert.scope {

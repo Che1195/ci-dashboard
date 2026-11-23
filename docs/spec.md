@@ -111,12 +111,24 @@ Accepted limits:
   is sent once more by the next launch.
 - A hold that starts and clears between two refreshes, or a queue that crosses 10 minutes and drains between two
   refreshes, isn't announced.
-- A hold whose log source is edited while it is red (even to fix a pattern) ends without a "cleared", as does one
-  announced by a version that saved no scope.
+- A hold whose log source is edited after its opening went out (even to fix a pattern) ends without a "cleared", as
+  does one announced by a version that saved no scope. (One edited while its opening still waits follows the new
+  log.)
 - GitHub's run lists are five separate requests per repo. A run that changes state between two of them can be
   missing from both although every request succeeded; if it was the only stuck job for its labels, that read ends
   the problem (silently) and the next read opens it again. The app doesn't wait for a second read before believing a
   complete one.
+- If macOS stops answering for over 2 s, alert bookkeeping pauses while refreshes go on. A hold that clears and
+  starts again during that pause counts as one problem (its second opening isn't sent); a log source removed and
+  restored during it can let a read with no marker count as the hold's clear.
+- An opening macOS accepts in the instant the switch is turned off isn't recorded, so that hold's later clear is
+  silent. A clear still waiting behind a stalled opening is lost if the app quits then.
+- A saved hold whose log can't be read on a relaunch still counts as red, so a waiting opening can be sent on
+  permission without a fresh hold line.
+- A failed jobs request shows its run as one queued placeholder aged from the run's start; it can open the long-queue
+  notice early, and a later real job crossing 10 minutes opens it again.
+- Stuck-job groups are keyed by their label text, so a single label literally named `a + b` and the two labels `a`
+  and `b` share one notice.
 - A hold saved by a build before v1.1, with no alert yet, takes the scope of the runner's log source at its first
   refresh with unchanged settings, even if a different source showed it.
 

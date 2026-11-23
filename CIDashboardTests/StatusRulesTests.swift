@@ -1644,6 +1644,64 @@ final class StatusRulesTests: XCTestCase {
         XCTAssertEqual(sent(notifier), ["hold:mac opened", "hold:mac cleared"])
     }
 
+    /// Closing audit: an announced hold whose clear line is read by a refresh made stale by an unrelated edit
+    /// still says it cleared, exactly once (the old dashboard still showing it doesn't veto the clear).
+    @MainActor
+    func testAClearReadByAStaleRefreshIsStillAnnounced() async throws {
+        let defaults = try freshDefaults()
+        defer { forget(defaults) }
+        var settings = AppSettings()
+        settings.logSources = [source("mac", host: "h")]
+        let runner = GatedRunner { $0 == 1 ? "cleanup failed\n" : "cleanup succeeded\n" }
+        let notifier = SilentNotifier()
+        let store = alertStore(defaults, settings, runner: runner, notifier: notifier)
+        runner.open()
+        await store.refresh()
+        XCTAssertEqual(sent(notifier), ["hold:mac opened"])
+
+        let gated = GatedRunner { _ in "cleanup succeeded\n" }
+        let staleStore = DashboardStore(commandRunner: gated, defaults: defaults, notifier: notifier)
+        XCTAssertEqual(staleStore.overall.level, .red, "relaunched showing the saved hold")
+        let refresh = Task { await staleStore.refresh() }
+        let waitUntil = Date().addingTimeInterval(10)
+        while gated.sshCalls == 0 {
+            guard Date() < waitUntil else { return XCTFail("refresh never ran ssh") }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        staleStore.setDisabled("other", true)   // unrelated: makes this refresh's GitHub half stale
+        gated.open()
+        await refresh.value
+        while staleStore.isRefreshing { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertEqual(sent(notifier), ["hold:mac opened", "hold:mac cleared"])
+    }
+
+    /// Closing audit: editing a holding runner's log while its opening waits for permission doesn't strand it.
+    @MainActor
+    func testAWaitingOpeningFollowsAnEditedLog() async throws {
+        let defaults = try freshDefaults()
+        defer { forget(defaults) }
+        var settings = AppSettings()
+        settings.logSources = [source("mac", host: "h")]
+        let notifier = SilentNotifier()
+        notifier.delivers = false
+        let cleared = LogFlag()
+        let store = alertStore(
+            defaults, settings,
+            runner: GatedRunner { _ in cleared.isSet ? "cleanup succeeded\n" : "cleanup failed\n" }.opened(),
+            notifier: notifier)
+        await store.refresh()
+        XCTAssertEqual(SettingsStore.loadAlerts(defaults).pending, ["hold:mac"])
+        store.settings.logSources[0].path = "/var/log/other.log"
+        try await settle(store)
+        notifier.delivers = true
+        await store.refresh()
+        XCTAssertEqual(sent(notifier), ["hold:mac opened"])
+        // The opening went out for the edited log, so that log's clear line is what ends it.
+        cleared.set()
+        await store.refresh()
+        XCTAssertEqual(sent(notifier), ["hold:mac opened", "hold:mac cleared"])
+    }
+
     /// The dashboard never waits long for macOS: if it doesn't answer for a notification, refreshes go on, the
     /// alert bookkeeping stays as it was, and it catches up (opening first, then the clear) once macOS answers.
     @MainActor
@@ -1804,6 +1862,13 @@ final class FakeCI: CommandRunning, @unchecked Sendable {
 }
 
 /// Tells a background thread to stop, and waits until it has.
+final class LogFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+    var isSet: Bool { lock.withLock { value } }
+    func set() { lock.withLock { value = true } }
+}
+
 final class StopFlag: @unchecked Sendable {
     private let lock = NSLock()
     private var stopped = false

@@ -326,9 +326,16 @@ final class DashboardStore {
     /// tracked and watched, and (for an opening) still red on the dashboard; (for a clear) not red again.
     private func stillWanted(_ key: String, cleared: Bool) -> Bool {
         guard settings.notify else { return false }
-        let redNow = currentAlertKeys().contains(key)
+        // A hold is judged by the latest accepted log evidence (confirmedHolds), which a refresh whose GitHub half
+        // was dropped still updates; the dashboard may still show the hold such a refresh saw end.
+        let hold = AlertRules.holdRunner(key)
+        let redNow = hold.map { confirmedHolds[$0] != nil } ?? currentAlertKeys().contains(key)
         if cleared { return !redNow }
         guard pendingOpenings.contains(key), let alert = activeAlerts[key], redNow else { return false }
+        if let hold {
+            // An opening needs a log that is still read for that runner (whichever it is now).
+            return LogReader.uniqueSources(settings.logSources).contains { $0.runnerName == hold }
+        }
         guard alert.scope != nil else { return true }
         return AlertRules.watchedScope(alert, repos: Set(settings.repos.map { $0.lowercased() }),
                                        readable: LogReader.uniqueSources(settings.logSources)) != nil
