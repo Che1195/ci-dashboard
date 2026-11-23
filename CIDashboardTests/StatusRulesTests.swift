@@ -545,6 +545,69 @@ final class StatusRulesTests: XCTestCase {
         let dash = StatusRules.build(snapshots: [snap], logs: [:], seen: [], now: now)
         XCTAssertEqual(dash.queued.map(\.id), [-20])
     }
+
+    // MARK: Audit 3
+
+    func localSource(_ url: URL) -> LogSource {
+        var source = LogSource(); source.runnerName = "local-\(UUID())"; source.path = url.path
+        return source
+    }
+
+    func testClearLineAfterAHugeLineIsDecisive() async throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("clear-\(UUID()).log")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let body = "cleanup failed\n" + String(repeating: "z", count: Int(LogReader.localReadLimit) + 10) + "\ncleanup succeeded\n"
+        try body.write(to: url, atomically: true, encoding: .utf8)
+        let status = await LogReader.read(localSource(url), runner: HangingRunner())
+        XCTAssertEqual(status.holding, false)
+        XCTAssertNil(status.error)
+        let after = StatusRules.stickyHolds(["r": status], configured: ["r"], previous: ["r": now], now: now)
+        XCTAssertNil(after.holds["r"], "the clear line ends the hold")
+    }
+
+    func testIncompleteReadWithNoMarkerIsUnknown() async throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("nomark-\(UUID()).log")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try (String(repeating: "z", count: Int(LogReader.localReadLimit) + 10) + "\nhello\n")
+            .write(to: url, atomically: true, encoding: .utf8)
+        let status = await LogReader.read(localSource(url), runner: HangingRunner())
+        XCTAssertNil(status.holding)
+        XCTAssertNotNil(status.error)
+    }
+
+    func testConfirmedHoldsSurviveARelaunch() throws {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "holds-\(UUID())"))
+        SettingsStore.saveHolds(["mac": now], defaults)
+        XCTAssertEqual(SettingsStore.loadHolds(defaults), ["mac": now])
+    }
+
+    func testHoldsStillShowWithoutGh() async {
+        let snaps = await DashboardStore.snapshots(["o/r"], client: nil)
+        XCTAssertEqual(snaps.map(\.runnersOK), [false])
+        let logs = ["mac": LogStatus(holding: true, lastLine: "cleanup failed", error: nil)]
+        let dash = StatusRules.build(snapshots: snaps, logs: logs, seen: [], now: now)
+        XCTAssertEqual(dash.overall.level, .red)
+    }
+
+    func testGhNeverPagesOrPretendsToBeATerminal() {
+        let env = ProcessRunner.environment(for: "/opt/homebrew/bin/gh",
+                                            inherited: ["GH_PAGER": "less", "GH_FORCE_TTY": "1"])
+        XCTAssertEqual(env["GH_PAGER"], "cat")
+        XCTAssertNil(env["GH_FORCE_TTY"])
+        XCTAssertEqual(env["GH_TELEMETRY"], "false")
+        XCTAssertTrue(LogReader.sshArguments(host: "h", path: "/p").contains("GSSAPIDelegateCredentials=no"))
+    }
+
+    func testSlotFreesWhenALateReadFinishes() async throws {
+        var source = LogSource(); source.runnerName = "late-\(UUID())"; source.host = "h"; source.path = "/p"
+        let slow = SlowRunner(delay: 0.4)
+        let first = await LogReader.readWithDeadline(source, runner: slow, deadline: 0.1)
+        XCTAssertEqual(first.error, "log read timed out")
+        try await Task.sleep(for: .seconds(0.8))
+        let again = await LogReader.readWithDeadline(source, runner: slow, deadline: 2)
+        XCTAssertNotEqual(again.error, "previous log read still running")
+        XCTAssertEqual(again.holding, false)
+    }
 }
 
 final class RecordingRunner: CommandRunning, @unchecked Sendable {
@@ -571,5 +634,14 @@ final class HangingRunner: CommandRunning {
     func run(_ executable: String, _ arguments: [String], timeout: TimeInterval) async throws -> CommandResult {
         try await Task.sleep(for: .seconds(3600))
         return CommandResult(status: 0, stdout: Data(), stderr: Data(), timedOut: false)
+    }
+}
+
+final class SlowRunner: CommandRunning {
+    let delay: Double
+    init(delay: Double) { self.delay = delay }
+    func run(_ executable: String, _ arguments: [String], timeout: TimeInterval) async throws -> CommandResult {
+        try await Task.sleep(for: .seconds(delay))
+        return CommandResult(status: 0, stdout: Data("cleanup succeeded\n".utf8), stderr: Data(), timedOut: false)
     }
 }

@@ -94,4 +94,17 @@ enum SettingsStore {
     static func saveSeen(_ s: [SeenRunner], _ defaults: UserDefaults = .standard) {
         if let data = try? JSONEncoder().encode(s) { defaults.set(data, forKey: seenKey) }
     }
+
+    /// Confirmed holds survive a relaunch: a hold whose marker has scrolled out of the log must not come back green.
+    static let holdsKey = "confirmedHolds.v1"
+
+    static func loadHolds(_ defaults: UserDefaults = .standard) -> [String: Date] {
+        guard let data = defaults.data(forKey: holdsKey),
+              let h = try? JSONDecoder().decode([String: Date].self, from: data) else { return [:] }
+        return h
+    }
+
+    static func saveHolds(_ h: [String: Date], _ defaults: UserDefaults = .standard) {
+        if let data = try? JSONEncoder().encode(h) { defaults.set(data, forKey: holdsKey) }
+    }
 }

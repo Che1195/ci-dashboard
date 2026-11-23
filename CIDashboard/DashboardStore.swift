@@ -36,7 +36,7 @@ final class DashboardStore {
 
     private var seen: [SeenRunner]
     /// Runner name → when its log last showed a hold; kept until a clear line (see StatusRules.stickyHolds).
-    private var confirmedHolds: [String: Date] = [:]
+    private var confirmedHolds: [String: Date] = SettingsStore.loadHolds()
     /// Advances every 5 s; views that show age-based status read it so they re-evaluate between refreshes.
     private(set) var clock = Date()
     private var clockLoop: Task<Void, Never>?
@@ -117,19 +117,55 @@ final class DashboardStore {
 
     private func refreshOnce() async {
         let generation = settingsGeneration
-        guard let client = client() else {
-            globalError = GitHubError.ghNotFound.localizedDescription
-            dashboard = Dashboard()
-            rateLimit = nil
-            lastRefresh = Date()
-            return
-        }
+        // Without gh, GitHub can't be read, but runner logs still can: holds keep showing through a gh outage.
+        let ghClient = client()
         let repos = settings.repos
         let sources = settings.logSources
         let runner = commandRunner
 
         // A few repos at a time keeps the number of gh processes (and their pipes) bounded.
-        async let snaps: [RepoSnapshot] = withTaskGroup(of: (Int, RepoSnapshot).self) { group in
+        async let snaps: [RepoSnapshot] = Self.snapshots(repos, client: ghClient)
+        async let logs = LogReader.readAll(sources, runner: runner)
+        async let rate = try? ghClient?.rateLimit()
+        let (snapshots, logStatus, rateCore) = await (snaps, logs, rate)
+        let now = Date()
+        // Log evidence is recorded before the settings check below, so a settings edit can't discard a clear line.
+        let sticky = StatusRules.stickyHolds(
+            logStatus, configured: LogReader.uniqueSources(sources).map(\.runnerName), previous: confirmedHolds, now: now)
+        confirmedHolds = sticky.holds
+        SettingsStore.saveHolds(confirmedHolds)
+        // Settings changed while we were fetching: drop this result and fetch again.
+        guard generation == settingsGeneration else { refreshAgain = true; return }
+
+        let nothingLoaded = snapshots.allSatisfy { !$0.runnersOK && $0.runs.isEmpty }
+        if ghClient == nil {
+            globalError = GitHubError.ghNotFound.localizedDescription
+        } else if rateCore == nil && nothingLoaded {
+            // Nothing loaded at all (gh signed out, network down): say it once.
+            globalError = "Can't reach GitHub through gh. Check `gh auth status` and the network."
+        } else if rateCore == nil {
+            globalError = "Couldn't read the GitHub API rate limit."
+        } else {
+            globalError = nil
+        }
+        updateSeen(snapshots, now: now)
+        dashboard = StatusRules.build(snapshots: snapshots, logs: sticky.logs, seen: seen, now: now)
+        rateLimit = rateCore
+        lastRefresh = now
+    }
+
+    /// Each repo's snapshot, a few repos at a time (bounding gh processes and their pipes). Without gh, every repo
+    /// comes back unreadable, so nothing is judged absent or stranded.
+    static func snapshots(_ repos: [String], client: GitHubClient?) async -> [RepoSnapshot] {
+        guard let client else {
+            return repos.map { repo in
+                var snap = RepoSnapshot(repo: repo)
+                snap.runnersOK = false
+                snap.runnersComplete = false
+                return snap
+            }
+        }
+        return await withTaskGroup(of: (Int, RepoSnapshot).self) { group in
             var iterator = repos.enumerated().makeIterator()
             func addNext() -> Bool {
                 guard let (i, repo) = iterator.next() else { return false }
@@ -144,30 +180,6 @@ final class DashboardStore {
             }
             return out.sorted { $0.0 < $1.0 }.map(\.1)
         }
-        async let logs = LogReader.readAll(sources, runner: runner)
-        async let rate = try? client.rateLimit()
-        let (snapshots, logStatus, rateCore) = await (snaps, logs, rate)
-        // Settings changed while we were fetching: drop this result and fetch again.
-        guard generation == settingsGeneration else { refreshAgain = true; return }
-
-        let now = Date()
-        // Nothing loaded at all (gh signed out, network down): say it once. A failed rate-limit read alone is its
-        // own, milder reason.
-        let nothingLoaded = snapshots.allSatisfy { !$0.runnersOK && $0.runs.isEmpty }
-        if rateCore == nil && nothingLoaded {
-            globalError = "Can't reach GitHub through gh. Check `gh auth status` and the network."
-        } else if rateCore == nil {
-            globalError = "Couldn't read the GitHub API rate limit."
-        } else {
-            globalError = nil
-        }
-        updateSeen(snapshots, now: now)
-        let sticky = StatusRules.stickyHolds(
-            logStatus, configured: LogReader.uniqueSources(sources).map(\.runnerName), previous: confirmedHolds, now: now)
-        confirmedHolds = sticky.holds
-        dashboard = StatusRules.build(snapshots: snapshots, logs: sticky.logs, seen: seen, now: now)
-        rateLimit = rateCore
-        lastRefresh = now
     }
 
     private func updateSeen(_ snapshots: [RepoSnapshot], now: Date) {

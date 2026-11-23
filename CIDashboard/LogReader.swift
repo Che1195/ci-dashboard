@@ -11,6 +11,7 @@ enum LogReader {
     static func sshArguments(host: String, path: String) -> [String] {
         ["-o", "BatchMode=yes", "-o", "ConnectTimeout=4", "-o", "ClearAllForwardings=yes",
          "-o", "PermitLocalCommand=no", "-o", "ForwardAgent=no", "-o", "ForwardX11=no",
+         "-o", "GSSAPIDelegateCredentials=no",
          // Never write known_hosts during a poll, and only talk to hosts already trusted.
          "-o", "UpdateHostKeys=no", "-o", "StrictHostKeyChecking=yes",
          // Stay in the foreground with no shared connection, so the deadline covers the whole session.
@@ -82,10 +83,10 @@ enum LogReader {
         let nonEmpty = result.lines.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
         let holding = StatusRules.isHolding(
             lines: nonEmpty, holdPattern: source.holdPattern, clearPattern: source.clearPattern)
-        // A read that couldn't cover the last 200 lines can't prove "not holding": say so on the row.
-        let note = (!result.complete && holding != true) ? "only part of the last \(lineCount) lines could be read" : nil
-        return LogStatus(holding: result.complete ? holding : (holding == true ? true : nil),
-                         lastLine: nonEmpty.last.map { String($0.prefix(160)) }, error: note)
+        // The lines read are whole lines ending at the file's end, so the latest marker among them is decisive even if
+        // the read stopped short of 200 lines. Only "no marker found" is uncertain then: say so on the row.
+        let note = (!result.complete && holding == nil) ? "only part of the last \(lineCount) lines could be read" : nil
+        return LogStatus(holding: holding, lastLine: nonEmpty.last.map { String($0.prefix(160)) }, error: note)
     }
 
     struct TailResult: Sendable {

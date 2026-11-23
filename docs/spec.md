@@ -45,7 +45,7 @@ local file or runs `ssh <host> tail -n <N> <path>`. A unit test checks that ever
 ## Status rules
 | Runner | When |
 |---|---|
-| Holding | log source says holding (wins over everything). A hold stays until the log shows a clear line: a failed or timed-out read, or a marker scrolled out of the last 200 lines, keeps it, with a note saying when it was last confirmed |
+| Holding | log source says holding (wins over everything). A hold stays until the log shows a clear line: a failed or timed-out read, or a marker scrolled out of the last 200 lines, keeps it, with a note saying when it was last confirmed. Holds are saved, so a relaunch keeps them; logs are read even when `gh` is missing or GitHub is unreachable |
 | Busy | `status == online && busy` |
 | Idle | `status == online && !busy` |
 | Offline | `status == offline` |

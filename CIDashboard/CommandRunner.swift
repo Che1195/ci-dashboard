@@ -34,6 +34,12 @@ struct ProcessRunner: CommandRunning {
         env["PATH"] = searchPath
         env["GH_PROMPT_DISABLED"] = "1"
         env["NO_COLOR"] = "1"
+        // Never page output through a helper, never pretend to be a terminal, and send no usage telemetry.
+        env["GH_PAGER"] = "cat"
+        env["PAGER"] = "cat"
+        env["GH_FORCE_TTY"] = nil
+        env["GH_TELEMETRY"] = "false"
+        env["GH_NO_UPDATE_NOTIFIER"] = "1"
         return env
     }
 
