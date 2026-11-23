@@ -9,14 +9,12 @@ final class DashboardStore {
             let sourcesChanged = !settings.logSources.readLike(oldValue.logSources)
             guard settings != oldValue || sourcesChanged else { return }
             SettingsStore.save(settings, defaults)
-            // What is watched changed: a problem that drops out because of it didn't end, so it goes quietly.
-            if settings.repos != oldValue.repos || sourcesChanged { quietClears = true }
             if settings.repos != oldValue.repos || sourcesChanged
                 || settings.ghPath != oldValue.ghPath || settings.disabledRunners != oldValue.disabledRunners {
                 settingsGeneration += 1
                 Task { await refresh() }
             }
-            if settings.notify && !oldValue.notify { notifier.prepare() }
+            if settings.notify && !oldValue.notify { askPermission() }
             if settings.refreshSeconds != oldValue.refreshSeconds || settings.hourlyDiscovery != oldValue.hourlyDiscovery {
                 startLoops()
             }
@@ -51,11 +49,18 @@ final class DashboardStore {
     private let defaults: UserDefaults
 
     /// Problems red at the last refresh, by key, so each notifies once when it appears and once when it clears.
+    /// Each carries what was watched when it was seen (see `AlertRules.step`). Saved with the two lists below.
     private var activeAlerts: [String: Alert]
-    /// The active problems whose opening notification was posted; only those say when they clear.
+    /// The active problems whose opening notification macOS accepted; only those say when they clear.
     private var announced: Set<String>
-    /// Set when the watched repos or log sources change; the next refresh retires vanished problems silently.
-    private var quietClears = false
+    /// The active problems whose opening is still to be handed to macOS (the permission prompt is unanswered, or
+    /// permission is denied), oldest first. Tried again at every refresh, and by the next launch.
+    private var pendingOpenings: [String]
+    /// The problems the latest refresh saw. An opening is sent only for these: not for one loaded from the last
+    /// run, or kept through an incomplete read, that no read since has shown.
+    private var sighted: Set<String> = []
+    /// The hand-over of due notifications to macOS, while it runs.
+    private var delivery: Task<Void, Never>?
     private let notifier: Notifying
     private static var underTests: Bool { ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil }
 
@@ -73,14 +78,19 @@ final class DashboardStore {
         let active = Dictionary(saved.active.map { ($0.key, $0) }, uniquingKeysWith: { a, _ in a })
         activeAlerts = active
         announced = Set(saved.announced).intersection(active.keys)
+        pendingOpenings = saved.pending.filter { active[$0] != nil && !saved.announced.contains($0) }
         // Holds the last run saved show from the first frame, not only once the first refresh has finished.
         dashboard = StatusRules.restoredDashboard(
             holds: confirmedHolds, sources: loaded.logSources, repos: loaded.repos, seen: seen, now: Date())
+        if settings.notify { askPermission() }
         // The unit-test host launches the app; don't poll GitHub from tests.
-        if !Self.underTests {
-            if settings.notify { self.notifier.prepare() }
-            startLoops()
-        }
+        if !Self.underTests { startLoops() }
+    }
+
+    /// Asks for permission to notify if macOS hasn't asked yet. Once the prompt is answered, a refresh sends the
+    /// openings that waited for it.
+    private func askPermission() {
+        notifier.prepare { [weak self] in await self?.refresh() }
     }
 
     /// The status now. Queue-age thresholds are re-checked against the clock, so a job crossing 3 or 10 minutes
@@ -170,8 +180,16 @@ final class DashboardStore {
             confirmedHolds = sticky.holds
             SettingsStore.saveHolds(confirmedHolds, defaults)
         }
-        // Settings changed while we were fetching: drop the rest of this result and fetch again.
-        guard settingsCurrent else { refreshAgain = true; return }
+        // Settings changed while we were fetching: drop the GitHub half of this result and fetch again. What the
+        // logs showed is kept (above), so it is announced too: a hold read here and cleared by the next read would
+        // otherwise never be said. Every confirmed hold counts; GitHub-based problems stay as they were.
+        guard settingsCurrent else {
+            await updateAlerts(
+                found: AlertRules.holdAlerts(Array(confirmedHolds.keys), sources: settings.logSources),
+                githubComplete: false)
+            refreshAgain = true
+            return
+        }
 
         let nothingLoaded = snapshots.allSatisfy { !$0.runnersOK && $0.runs.isEmpty }
         if ghClient == nil {
@@ -189,9 +207,10 @@ final class DashboardStore {
                                       disabled: Set(settings.disabledRunners))
         // GitHub-based problems may only be judged gone when every repo was read in full.
         let githubComplete = ghClient != nil && snapshots.allSatisfy { $0.error == nil && $0.runnersOK }
-        notifyChanges(now: now, githubComplete: githubComplete)
         rateLimit = rateCore
         lastRefresh = now
+        await updateAlerts(found: AlertRules.alerts(dashboard, sources: settings.logSources, now: now),
+                           githubComplete: githubComplete)
     }
 
     /// Each repo's snapshot, a few repos at a time (bounding gh processes and their pipes). Without gh, every repo
@@ -215,18 +234,59 @@ final class DashboardStore {
         }
     }
 
-    /// Notifies problems that appeared since the last refresh, and those that cleared (see `AlertRules.step`).
-    private func notifyChanges(now: Date, githubComplete: Bool) {
+    /// Brings the alert bookkeeping up to date with what a refresh found (see `AlertRules.step`), then hands
+    /// macOS the notifications that are due. Runs only inside a refresh, one at a time, and never while an
+    /// earlier hand-over is unfinished, so nothing changes the bookkeeping while macOS is being asked.
+    private func updateAlerts(found: [Alert], githubComplete: Bool) async {
+        // macOS answers in milliseconds. If it still hasn't answered for the last notifications, it is stuck: the
+        // bookkeeping waits (the next refresh that finds it free catches up) and the dashboard carries on.
+        guard delivery == nil else { return }
         let step = AlertRules.step(
-            previous: activeAlerts, announced: announced, found: AlertRules.alerts(dashboard, now: now),
-            githubComplete: githubComplete, quiet: quietClears,
-            sourced: Set(settings.logSources.map(\.runnerName)), notify: settings.notify)
-        quietClears = false
+            previous: activeAlerts, announced: announced, pending: pendingOpenings, found: found,
+            githubComplete: githubComplete, repos: settings.repos, sources: settings.logSources,
+            notify: settings.notify)
         activeAlerts = step.active
         announced = step.announced
-        for post in step.posts { notifier.post(post.alert, cleared: post.cleared) }
+        pendingOpenings = step.pending
+        sighted = Set(found.map(\.key))
+        // Saved before anything is sent: an opening still waiting when the app quits is sent by the next launch.
+        saveAlerts()
+        let task = Task {
+            await self.deliver(cleared: step.cleared)
+            self.delivery = nil
+        }
+        delivery = task
+        await Self.wait(for: task, atMost: .seconds(2))
+    }
+
+    private func deliver(cleared: [Alert]) async {
+        // An opening counts as announced only once macOS has accepted it. The switch is read again each time: it
+        // can be turned off while macOS is being asked.
+        for key in pendingOpenings where sighted.contains(key) {
+            guard settings.notify, let alert = activeAlerts[key] else { continue }
+            guard await notifier.post(alert, cleared: false) else { continue }
+            pendingOpenings.removeAll { $0 == key }
+            announced.insert(key)
+            saveAlerts()
+        }
+        // Each of these had its opening accepted in an earlier refresh, so an opening always comes first.
+        for alert in cleared where settings.notify {
+            _ = await notifier.post(alert, cleared: true)
+        }
+    }
+
+    /// Returns when `task` ends or `limit` has passed, whichever comes first.
+    private static func wait(for task: Task<Void, Never>, atMost limit: Duration) async {
+        let (ended, end) = AsyncStream<Void>.makeStream()
+        Task { await task.value; end.finish() }
+        let timer = Task { try? await Task.sleep(for: limit); end.finish() }
+        for await _ in ended {}
+        timer.cancel()
+    }
+
+    private func saveAlerts() {
         let save = SettingsStore.SavedAlerts(active: activeAlerts.values.sorted { $0.key < $1.key },
-                                             announced: announced.sorted())
+                                             announced: announced.sorted(), pending: pendingOpenings)
         if save != SettingsStore.loadAlerts(defaults) { SettingsStore.saveAlerts(save, defaults) }
     }
 

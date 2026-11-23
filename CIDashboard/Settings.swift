@@ -36,14 +36,16 @@ struct LogSource: Codable, Hashable, Identifiable, Sendable {
     /// True when both read the same log for the same runner and judge it by the same patterns (the row's `id`
     /// plays no part). Log results count only for a source that is still like the one that was read.
     func readsLike(_ other: LogSource) -> Bool {
-        // Host and path by their bytes: two spellings Swift calls equal (é composed or not) can be different files.
-        runnerName == other.runnerName && host.utf8.elementsEqual(other.host.utf8) && path.utf8.elementsEqual(other.path.utf8)
-            && holdPattern == other.holdPattern && clearPattern == other.clearPattern
+        // Host, path and patterns by their bytes: two spellings Swift calls equal (é composed or not) can be
+        // different files, and a pattern matches only the spelling it was written in.
+        func same(_ a: String, _ b: String) -> Bool { a.utf8.elementsEqual(b.utf8) }
+        return runnerName == other.runnerName && same(host, other.host) && same(path, other.path)
+            && same(holdPattern, other.holdPattern) && same(clearPattern, other.clearPattern)
     }
 }
 
 extension [LogSource] {
-    /// Equal row for row, comparing hosts and paths by their bytes (see `LogSource.readsLike`).
+    /// Equal row for row, comparing hosts, paths and patterns by their bytes (see `LogSource.readsLike`).
     func readLike(_ other: [LogSource]) -> Bool {
         count == other.count && zip(self, other).allSatisfy { $0.id == $1.id && $0.readsLike($1) }
     }
@@ -127,11 +129,26 @@ enum SettingsStore {
     /// Confirmed holds survive a relaunch: a hold whose marker has scrolled out of the log must not come back green.
     static let alertsKey = "activeAlerts.v1"
 
-    /// What is red now, and which of those were announced. Kept across launches so a relaunch neither repeats an
-    /// alert for a problem that stayed red nor misses that one cleared.
+    /// What is red now (each problem with what was watched when it was seen), which openings macOS accepted, and
+    /// which are still waiting to be sent. Kept across launches so a relaunch neither repeats an alert for a
+    /// problem that stayed red, nor misses that one cleared, nor loses an opening that hadn't gone out yet.
     struct SavedAlerts: Codable, Equatable {
         var active: [Alert] = []
         var announced: [String] = []
+        var pending: [String] = []
+
+        init(active: [Alert] = [], announced: [String] = [], pending: [String] = []) {
+            self.active = active
+            self.announced = announced
+            self.pending = pending
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            active = try c.decodeIfPresent([Alert].self, forKey: .active) ?? []
+            announced = try c.decodeIfPresent([String].self, forKey: .announced) ?? []
+            pending = try c.decodeIfPresent([String].self, forKey: .pending) ?? []
+        }
     }
 
     static func loadAlerts(_ defaults: UserDefaults = .standard) -> SavedAlerts {

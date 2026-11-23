@@ -72,17 +72,49 @@ Rate-limit remaining is shown in the footer.
 
 ## Notifications (v1.1)
 A runner holding, jobs no online runner can take (per label set), and a job queued over 10 min each notify once
-when they start. A hold or stranded label set notifies again when it clears; a drained queue doesn't. A recovery is
-announced only when it was seen: GitHub-based problems stay red while any repo's read is incomplete (failed, cut off,
-or no `gh`); a hold's clear needs its log source still to exist; problems that vanish because the watched repos or
-log sources changed go quietly; and only problems whose opening was announced say when they clear (nothing raised
-while notifications were off). What is red, and what was announced, is saved, so a relaunch neither repeats nor
-misses one. Notifications wait for macOS's permission answer. Settings → General has the switch (on by default) and
-**Launch at login** (`SMAppService`; re-read whenever the app or window becomes active).
+when they start. A hold or stranded label set notifies again when it clears ("<runner> is no longer holding", "No
+jobs are waiting on <labels> now": the jobs may have run or been cancelled); a drained queue doesn't. Settings →
+General has the switch (on by default) and **Launch at login** (`SMAppService`; re-read whenever the app or window
+becomes active). Notifications also show while the app itself is frontmost.
 
-Accepted limits: a notification macOS fails to schedule isn't retried; a hold that starts and clears between two
-refreshes, or a queue that crosses 10 minutes and drains between two refreshes, isn't announced; a real clear in the
-same refresh as an edit to the watched repos or log sources goes quietly.
+**A recovery is announced only when it was seen, for a problem that is still watched.**
+- GitHub-based problems stay red while any repo's read is incomplete (failed, cut off, or no `gh`).
+- Each problem is saved with its scope: for stuck jobs and a long queue, the watched repos whose jobs show it; for a
+  hold, the log source (host, path, both patterns) that showed it. A repo that is no longer watched drops out of the
+  scope, and a problem left with none of its repos is forgotten at once, without a word, even on an incomplete read
+  (the same trouble in another repo later is a new problem and opens again). A hold's clear is announced only when
+  it is read from the same log source that showed the hold; if that source was removed or edited, the hold ends
+  silently. Because the scope is saved, none of this depends on which refresh comes next or on a relaunch.
+- A hold seen by a refresh whose GitHub half was dropped (a setting changed meanwhile) is still announced.
+
+**An opening counts only once macOS has accepted it.** A new problem's opening waits in a saved list until macOS
+takes the notification; only then is it recorded as announced, and only announced problems say when they clear. So
+"cleared" is never the first thing said about a problem. The app's switch and macOS's permission are read again for
+every notification, never remembered. While the permission prompt is unanswered or permission is denied, openings
+wait: answering the prompt, a later grant in System Settings, or the next launch sends them, as long as the problem
+is still on the dashboard (seen by the latest read, not merely kept through an incomplete one). A problem that ends
+while its opening waits ends silently. Turning the switch off drops waiting openings for good; problems are still
+tracked while it is off, so turning it on doesn't replay what is already red, and nothing raised while it was off
+says when it clears. What is red, what was announced and what is waiting are saved, so a relaunch neither repeats
+nor misses one.
+
+The dashboard never waits on macOS for more than 2 s: if it doesn't answer for a notification, refreshes carry on
+and the alert bookkeeping stands still until it does.
+
+Accepted limits:
+- A "cleared" macOS fails to schedule isn't retried (an opening is, at each refresh, until accepted or the problem
+  ends). If the app is killed in the instant between macOS accepting an opening and the app saving that, the opening
+  is sent once more by the next launch.
+- A hold that starts and clears between two refreshes, or a queue that crosses 10 minutes and drains between two
+  refreshes, isn't announced.
+- A hold whose log source is edited while it is red (even to fix a pattern) ends without a "cleared", as does one
+  announced by a version that saved no scope.
+- Stuck jobs in two repos share one notification per label set: after one of the repos is unwatched, "No jobs are
+  waiting…" is said when the other's are gone, and speaks only for watched repos.
+- GitHub's run lists are five separate requests per repo. A run that changes state between two of them can be
+  missing from both although every request succeeded; if it was the only stuck job for its labels, that read looks
+  like a recovery: "No jobs are waiting…" is said, and the next read opens the problem again. The app doesn't wait
+  for a second read before believing a complete one.
 
 ## Exclusions
 History charts, GitHub-hosted runner detail, organisation-level runners, any write action.
