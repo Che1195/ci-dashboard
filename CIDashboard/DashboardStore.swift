@@ -68,7 +68,7 @@ final class DashboardStore {
         let interval = max(10, settings.refreshSeconds)
         refreshLoop = Task { [weak self] in
             while !Task.isCancelled {
-                await self?.refresh()
+                await self?.refresh(fromTimer: true)
                 try? await Task.sleep(for: .seconds(interval))
             }
         }
@@ -84,8 +84,12 @@ final class DashboardStore {
     }
 
     /// Refreshes now. A call during a refresh asks for one more pass when it ends, so the latest settings always win.
-    func refresh() async {
-        if isRefreshing { refreshAgain = true; return }
+    /// A timer tick during a refresh is skipped; a manual refresh or settings change asks for one more pass.
+    func refresh(fromTimer: Bool = false) async {
+        if isRefreshing {
+            if !fromTimer { refreshAgain = true }
+            return
+        }
         isRefreshing = true
         repeat {
             refreshAgain = false
@@ -99,6 +103,9 @@ final class DashboardStore {
         let generation = settingsGeneration
         guard let client = client() else {
             globalError = GitHubError.ghNotFound.localizedDescription
+            dashboard = Dashboard()
+            rateLimit = nil
+            lastRefresh = Date()
             return
         }
         let repos = settings.repos
@@ -147,7 +154,11 @@ final class DashboardStore {
 
     /// Suggests owned repos with at least one self-hosted runner. Never adds them by itself.
     func discover() async {
-        guard !isDiscovering, let client = client() else { return }
+        guard !isDiscovering else { return }
+        guard let client = client() else {
+            discoveryError = GitHubError.ghNotFound.localizedDescription
+            return
+        }
         isDiscovering = true
         defer { isDiscovering = false }
         do {

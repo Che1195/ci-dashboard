@@ -36,7 +36,9 @@ local file or runs `ssh <host> tail -n <N> <path>`. A unit test checks that ever
   (default `cleanup failed`) and a *clear pattern* (default `cleanup succeeded|waiting for a job|Running job|Listening for Jobs`).
   The runner is **holding** when the most recent line matching either pattern matches the hold pattern. The last log
   line shows on the runner row (runner logs carry their own timestamps, which serve as its age). One source per runner
-  name: the first wins. SSH runs with forwarding and local commands off, and `tail -n 200 -- '<path>'`. Log reads that fail show "log unreadable" and never change other status.
+  name: the first wins. SSH runs with forwarding and `LocalCommand` off, and `tail -n 200 -- '<path>'`; the host's
+  own ssh config (for example a `ProxyCommand`) still applies, as for any `ssh` you run. Local paths must be regular
+  files and are opened without blocking. Log reads that fail show "log unreadable" and never change other status.
 - **Ephemeral runners** (they vanish from the API between jobs): runners seen in the last 24 h but missing now show as
   *not registered*, greyed, with "last seen", instead of disappearing.
 

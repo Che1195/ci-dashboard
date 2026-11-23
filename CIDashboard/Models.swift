@@ -30,6 +30,7 @@ struct APIRun: Decodable, Sendable, Equatable {
 }
 
 struct APIRunList: Decodable, Sendable {
+    let total_count: Int?
     let workflow_runs: [APIRun]
 }
 
@@ -53,6 +54,7 @@ struct APIJob: Decodable, Sendable, Equatable {
 }
 
 struct APIJobList: Decodable, Sendable {
+    let total_count: Int?
     let jobs: [APIJob]
 }
 

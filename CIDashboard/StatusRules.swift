@@ -120,7 +120,7 @@ enum StatusRules {
                     currentJob: running.first { $0.runnerName == r.name }, log: log, lastSeen: now))
             }
             if snap.runnersOK && snap.runnersComplete {
-                for s in seen where s.repo == snap.repo && !liveNames.contains(s.name)
+                for s in seen where s.repo.lowercased() == snap.repo.lowercased() && !liveNames.contains(s.name)
                     && now.timeIntervalSince(s.lastSeen) < rememberRunnersFor {
                     let log = logs[s.name]
                     rows.append(RunnerRow(
@@ -130,15 +130,20 @@ enum StatusRules {
                 }
             }
 
-            // A job is self-hosted if it asks for it, or a known self-hosted runner here has every label it needs.
+            // A job is self-hosted if it asks for it, or a known self-hosted runner here (live or remembered) has every
+            // label it needs.
+            let knownLabels = rows.map(\.labels)
+                + seen.filter { $0.repo.lowercased() == snap.repo.lowercased() }.map(\.labels)
             func classify(_ job: inout JobInfo) {
-                if !job.isSelfHosted { job.isSelfHosted = rows.contains { runner($0.labels, satisfies: job.labels) } }
+                if !job.isSelfHosted { job.isSelfHosted = knownLabels.contains { runner($0, satisfies: job.labels) } }
             }
+            // "No runner can take it" needs the complete runner list; a partial one proves nothing.
+            let canJudgeStranded = snap.runnersOK && snap.runnersComplete
             for i in running.indices { classify(&running[i]) }
             for i in queued.indices {
                 classify(&queued[i])
                 let job = queued[i]
-                if job.isSelfHosted {
+                if job.isSelfHosted && canJudgeStranded {
                     queued[i].stranded = !rows.contains { isTakingJobs($0.state) && runner($0.labels, satisfies: job.labels) }
                 }
             }
@@ -203,7 +208,8 @@ enum StatusRules {
         }
         for error in dash.repoErrors { raise(.orange, error) }
         // Green means idle with nothing queued; any work in flight is at least blue.
-        if level == .green && (!dash.running.isEmpty || !dash.queued.isEmpty) { level = .blue }
+        let busyRunner = dash.lanes.contains { $0.busyCount > 0 }
+        if level == .green && (!dash.running.isEmpty || !dash.queued.isEmpty || busyRunner) { level = .blue }
         return OverallStatus(level: level, reasons: reasons)
     }
 

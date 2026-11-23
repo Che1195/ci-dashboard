@@ -287,10 +287,11 @@ struct QueuedRow: View {
     }
 
     private func color(_ waited: TimeInterval) -> Color {
+        if job.stranded { return .red }
         switch StatusRules.queueColorLevel(waited: waited) {
-        case .red: .red
-        case .orange: .orange
-        default: job.stranded ? .red : .secondary
+        case .red: return .red
+        case .orange: return .orange
+        default: return .secondary
         }
     }
 }

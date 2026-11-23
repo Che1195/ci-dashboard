@@ -300,6 +300,54 @@ final class StatusRulesTests: XCTestCase {
         XCTAssertEqual(String(decoding: result.stdout, as: UTF8.self), "hello\n")
     }
 
+    func testNoStrandedVerdictWithoutACompleteRunnerList() {
+        var snap = RepoSnapshot(repo: "o/r")
+        snap.runnersOK = false
+        snap.runnersComplete = false
+        snap.error = "o/r: runners: HTTP 502"
+        snap.runs = [(run: run(1, status: "queued"), jobs: [job(1, run: 1, "queued", labels: ["self-hosted", "x"])])]
+        let dash = StatusRules.build(snapshots: [snap], logs: [:], seen: [], now: now)
+        XCTAssertEqual(dash.queued.first?.stranded, false)
+        XCTAssertTrue(dash.stranded.isEmpty)
+        XCTAssertEqual(dash.overall.level, .orange)
+    }
+
+    func testRememberedLabelsClassifyCustomLabelJobs() {
+        var snap = RepoSnapshot(repo: "O/R")
+        snap.runs = [(run: run(1, status: "queued"), jobs: [job(1, run: 1, "queued", labels: ["tt-web"])])]
+        let seen = [SeenRunner(repo: "o/r", name: "vm", labels: ["self-hosted", "tt-web"], os: nil, lastSeen: now)]
+        let dash = StatusRules.build(snapshots: [snap], logs: [:], seen: seen, now: now)
+        XCTAssertEqual(dash.queued.first?.isSelfHosted, true)
+        XCTAssertEqual(dash.lanes.first?.runners.first?.state, .notRegistered)
+    }
+
+    func testBusyRunnerWithoutVisibleJobIsBlue() {
+        var snap = RepoSnapshot(repo: "o/r")
+        snap.runners = [runner("w", "online", busy: true, labels: ["self-hosted", "x"])]
+        XCTAssertEqual(StatusRules.build(snapshots: [snap], logs: [:], seen: [], now: now).overall.level, .blue)
+    }
+
+    func testLocalTailRefusesNamedPipeWithoutBlocking() throws {
+        let path = FileManager.default.temporaryDirectory.appendingPathComponent("fifo-\(UUID())").path
+        XCTAssertEqual(mkfifo(path, 0o600), 0)
+        defer { unlink(path) }
+        XCTAssertThrowsError(try LogReader.localTail(path: path))
+    }
+
+    func testLocalTailMatchesTailOnShortFileWithBlankLines() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("short-\(UUID()).log")
+        defer { try? FileManager.default.removeItem(at: url) }
+        // A hold marker followed by 200 blank lines is outside `tail -n 200`, so it must not count locally either.
+        let text = "cleanup failed\n" + String(repeating: "\n", count: 200)
+        try text.write(to: url, atomically: true, encoding: .utf8)
+        let tail = try LogReader.localTail(path: url.path)
+        XCTAssertEqual(tail.count, 200)
+        XCTAssertFalse(tail.contains("cleanup failed"))
+        // And a short file is read whole.
+        try "a\nb\n".write(to: url, atomically: true, encoding: .utf8)
+        XCTAssertEqual(try LogReader.localTail(path: url.path), ["a", "b"])
+    }
+
     /// Every command the client actually runs, through its real call sites, is `gh api <path>`.
     func testClientCallSitesAreReadOnlyAndPartialFailuresKeepData() async throws {
         let recorder = RecordingRunner { args in

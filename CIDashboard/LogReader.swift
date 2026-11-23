@@ -69,8 +69,15 @@ enum LogReader {
     }
 
     static func localTail(path: String) throws -> [String] {
-        let handle = try FileHandle(forReadingFrom: URL(fileURLWithPath: path))
-        defer { try? handle.close() }
+        // Open without blocking (a named pipe would otherwise wait forever for a writer) and accept only regular files.
+        let fd = open(path, O_RDONLY | O_NONBLOCK)
+        guard fd >= 0 else { throw GitHubError.failed(String(cString: strerror(errno))) }
+        var info = stat()
+        guard fstat(fd, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG else {
+            close(fd)
+            throw GitHubError.failed("Not a regular file")
+        }
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
         let size = try handle.seekToEnd()
         // Read backwards in chunks until there are enough non-empty lines, up to a safety limit.
         let chunk: UInt64 = 64 * 1024
@@ -81,12 +88,12 @@ enum LogReader {
             try handle.seek(toOffset: start)
             data = (try handle.read(upToCount: Int(offset - start)) ?? Data()) + data
             offset = start
-            let lines = String(decoding: data, as: UTF8.self).split(separator: "\n", omittingEmptySubsequences: true)
-            // The first line may be partial unless we reached the start of the file.
-            if lines.count > lineCount || size - offset >= localReadLimit { break }
+            // Enough newlines for the last lineCount physical lines (like `tail -n`), or the safety limit.
+            if data.reduce(0, { $1 == 0x0A ? $0 + 1 : $0 }) > lineCount || size - offset >= localReadLimit { break }
         }
-        let lines = String(decoding: data, as: UTF8.self).components(separatedBy: "\n")
-            .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
-        return Array(lines.suffix(lineCount))
+        var physical = String(decoding: data, as: UTF8.self).components(separatedBy: "\n")
+        if physical.last == "" { physical.removeLast() }          // the file's final newline
+        if offset > 0, !physical.isEmpty { physical.removeFirst() } // a partial first line
+        return Array(physical.suffix(lineCount))
     }
 }

@@ -45,6 +45,8 @@ struct ProcessRunner: CommandRunning {
                 if data.isEmpty { handle.readabilityHandler = nil; state.streamEnded(stdout: false) }
                 else { state.append(data, stdout: false) }
             }
+            // Strong captures below keep `state` alive until it resumes the continuation; it then drops its handles and
+            // buffers, so a late timer only holds an empty object.
             process.terminationHandler = { p in
                 state.exited(p.terminationStatus)
                 // A descendant may keep a pipe open after the child exits; don't wait for it forever.
@@ -58,12 +60,15 @@ struct ProcessRunner: CommandRunning {
                 return
             }
             let pid = process.processIdentifier
+            // Signals go to our child only until its termination handler has run (checked under the lock that
+            // handler takes). Foundation reaps the child just before calling the handler, so the window in which a
+            // signal could reach a recycled PID is microseconds, and PID reuse inside it is not realistic.
             DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
                 guard !state.isFinished else { return }
                 state.markTimedOut()
-                kill(pid, SIGTERM)
+                state.signalIfRunning(pid, SIGTERM)
                 DispatchQueue.global().asyncAfter(deadline: .now() + Self.killGrace) {
-                    if !state.hasExited { kill(pid, SIGKILL) }
+                    state.signalIfRunning(pid, SIGKILL)
                 }
             }
             DispatchQueue.global().asyncAfter(deadline: .now() + timeout + Self.killGrace + Self.pipeGrace) {
@@ -86,7 +91,11 @@ private final class RunState: @unchecked Sendable {
     init(_ continuation: CheckedContinuation<CommandResult, Error>) { self.continuation = continuation }
 
     var isFinished: Bool { lock.withLock { continuation == nil } }
-    var hasExited: Bool { lock.withLock { status != nil } }
+
+    /// Sends `signal` to the child only if it hasn't been reaped yet.
+    func signalIfRunning(_ pid: pid_t, _ signal: Int32) {
+        lock.withLock { if status == nil && continuation != nil { kill(pid, signal) } }
+    }
 
     func append(_ data: Data, stdout: Bool) { lock.withLock { if stdout { out.append(data) } else { err.append(data) } } }
     func markTimedOut() { lock.withLock { timedOut = true } }
@@ -111,10 +120,12 @@ private final class RunState: @unchecked Sendable {
         let (c, result): (CheckedContinuation<CommandResult, Error>?, CommandResult) = lock.withLock {
             let c = continuation
             continuation = nil
-            return (c, CommandResult(status: status ?? -1, stdout: out, stderr: err, timedOut: timedOut || status == nil))
+            // Output cut short (no exit, or a stream still open) is never reported as a clean result.
+            let incomplete = status == nil || !outDone || !errDone
+            return (c, CommandResult(status: status ?? -1, stdout: out, stderr: err, timedOut: timedOut || incomplete))
         }
         guard let c else { return }
-        for h in handles { h.readabilityHandler = nil }
+        releaseHandles()
         c.resume(returning: result)
     }
 
@@ -124,7 +135,21 @@ private final class RunState: @unchecked Sendable {
             continuation = nil
             return c
         }
-        for h in handles { h.readabilityHandler = nil }
+        releaseHandles()
         c?.resume(throwing: error)
+    }
+
+    private func releaseHandles() {
+        let hs: [FileHandle] = lock.withLock {
+            let hs = handles
+            handles = []
+            out = Data()
+            err = Data()
+            return hs
+        }
+        for h in hs {
+            h.readabilityHandler = nil
+            try? h.close()
+        }
     }
 }

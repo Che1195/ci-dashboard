@@ -56,12 +56,16 @@ struct GitHubClient: Sendable {
         try await get("repos/\(repo)/actions/runners?per_page=100", as: APIRunnerList.self).runners
     }
 
-    func runs(_ repo: String, status: String) async throws -> [APIRun] {
-        try await get("repos/\(repo)/actions/runs?status=\(status)&per_page=50", as: APIRunList.self).workflow_runs
+    static let runsPerPage = 50
+    static let jobsPerPage = 100
+
+    func runs(_ repo: String, status: String) async throws -> APIRunList {
+        try await get("repos/\(repo)/actions/runs?status=\(status)&per_page=\(Self.runsPerPage)", as: APIRunList.self)
     }
 
-    func jobs(_ repo: String, runID: Int) async throws -> [APIJob] {
-        try await get("repos/\(repo)/actions/runs/\(runID)/jobs?per_page=100", as: APIJobList.self).jobs
+    /// Only jobs that haven't finished matter here; `filter=latest` keeps re-run attempts out.
+    func jobs(_ repo: String, runID: Int) async throws -> APIJobList {
+        try await get("repos/\(repo)/actions/runs/\(runID)/jobs?filter=latest&per_page=\(Self.jobsPerPage)", as: APIJobList.self)
     }
 
     func rateLimit() async throws -> APIRateLimit.Core {
@@ -109,13 +113,17 @@ struct GitHubClient: Sendable {
         var seen = Set<Int>()
         for (label, result) in [("queued", await queued), ("waiting", await waiting), ("in progress", await inProgress)] {
             switch result {
-            case .success(let runs): allRuns += runs.filter { seen.insert($0.id).inserted }
+            case .success(let list):
+                allRuns += list.workflow_runs.filter { seen.insert($0.id).inserted }
+                if (list.total_count ?? 0) > list.workflow_runs.count {
+                    errors.append("only the first \(Self.runsPerPage) \(label) runs are shown")
+                }
             case .failure(let error): errors.append("\(label) runs: \(error.localizedDescription)")
             }
         }
 
         // Jobs for each run, a few at a time; a failed run is left out and counted.
-        let results: [(Int, APIRun, [APIJob]?)] = await withTaskGroup(of: (Int, APIRun, [APIJob]?).self) { group in
+        let results: [(Int, APIRun, APIJobList?)] = await withTaskGroup(of: (Int, APIRun, APIJobList?).self) { group in
             var iterator = allRuns.enumerated().makeIterator()
             func addNext() -> Bool {
                 guard let (index, run) = iterator.next() else { return false }
@@ -123,7 +131,7 @@ struct GitHubClient: Sendable {
                 return true
             }
             for _ in 0..<Self.jobFetchConcurrency where addNext() {}
-            var out: [(Int, APIRun, [APIJob]?)] = []
+            var out: [(Int, APIRun, APIJobList?)] = []
             for await item in group {
                 out.append(item)
                 _ = addNext()
@@ -132,7 +140,9 @@ struct GitHubClient: Sendable {
         }
         let failedJobs = results.filter { $0.2 == nil }.count
         if failedJobs > 0 { errors.append("jobs for \(failedJobs) run\(failedJobs == 1 ? "" : "s") couldn't be read") }
-        snap.runs = results.compactMap { item in item.2.map { (run: item.1, jobs: $0) } }
+        let cutOff = results.filter { ($0.2?.total_count ?? 0) > ($0.2?.jobs.count ?? 0) }.count
+        if cutOff > 0 { errors.append("only the first \(Self.jobsPerPage) jobs of \(cutOff) large run\(cutOff == 1 ? "" : "s") are shown") }
+        snap.runs = results.compactMap { item in item.2.map { (run: item.1, jobs: $0.jobs) } }
 
         if !errors.isEmpty { snap.error = "\(repo): " + errors.joined(separator: "; ") }
         return snap
