@@ -172,6 +172,7 @@ enum StatusRules {
             dash.lanes += lanes.values.sorted { $0.key < $1.key }.map { lane in
                 var lane = lane
                 lane.runners.sort { $0.name < $1.name }
+                lane.runnerListComplete = canJudgeStranded
                 return lane
             }
         }

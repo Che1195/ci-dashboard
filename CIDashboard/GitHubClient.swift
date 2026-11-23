@@ -103,6 +103,7 @@ struct GitHubClient: Sendable {
         case .success(let list):
             snap.runners = list.runners
             snap.runnersComplete = list.total_count <= list.runners.count
+            if !snap.runnersComplete { errors.append("only the first \(list.runners.count) of \(list.total_count) runners are shown") }
         case .failure(let error):
             snap.runnersOK = false
             snap.runnersComplete = false
@@ -138,8 +139,11 @@ struct GitHubClient: Sendable {
             }
             return out.sorted { $0.0 < $1.0 }
         }
-        let failedJobs = results.filter { $0.2 == nil }.count
-        if failedJobs > 0 { errors.append("jobs for \(failedJobs) run\(failedJobs == 1 ? "" : "s") couldn't be read") }
+        let failedRuns = results.filter { $0.2 == nil }.map { "\($0.1.name ?? "run") #\($0.1.id)" }
+        if !failedRuns.isEmpty {
+            let named = failedRuns.prefix(3).joined(separator: ", ") + (failedRuns.count > 3 ? " and \(failedRuns.count - 3) more" : "")
+            errors.append("jobs couldn't be read for \(named)")
+        }
         let cutOff = results.filter { ($0.2?.total_count ?? 0) > ($0.2?.jobs.count ?? 0) }.count
         if cutOff > 0 { errors.append("only the first \(Self.jobsPerPage) jobs of \(cutOff) large run\(cutOff == 1 ? "" : "s") are shown") }
         snap.runs = results.compactMap { item in item.2.map { (run: item.1, jobs: $0.jobs) } }

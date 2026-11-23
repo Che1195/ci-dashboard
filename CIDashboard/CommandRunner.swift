@@ -94,10 +94,23 @@ private final class RunState: @unchecked Sendable {
 
     /// Sends `signal` to the child only if it hasn't been reaped yet.
     func signalIfRunning(_ pid: pid_t, _ signal: Int32) {
-        lock.withLock { if status == nil && continuation != nil { kill(pid, signal) } }
+        lock.withLock { if status == nil { kill(pid, signal) } }
     }
 
-    func append(_ data: Data, stdout: Bool) { lock.withLock { if stdout { out.append(data) } else { err.append(data) } } }
+    static let maxBytes = 8 * 1024 * 1024
+    private var overflow = false
+
+    /// Keeps at most `maxBytes` per stream; anything beyond marks the result incomplete.
+    func append(_ data: Data, stdout: Bool) {
+        lock.withLock {
+            guard continuation != nil else { return }
+            let current = stdout ? out.count : err.count
+            let room = max(0, Self.maxBytes - current)
+            if data.count > room { overflow = true }
+            let kept = data.prefix(room)
+            if stdout { out.append(kept) } else { err.append(kept) }
+        }
+    }
     func markTimedOut() { lock.withLock { timedOut = true } }
 
     func streamEnded(stdout: Bool) {
@@ -121,7 +134,7 @@ private final class RunState: @unchecked Sendable {
             let c = continuation
             continuation = nil
             // Output cut short (no exit, or a stream still open) is never reported as a clean result.
-            let incomplete = status == nil || !outDone || !errDone
+            let incomplete = status == nil || !outDone || !errDone || overflow
             return (c, CommandResult(status: status ?? -1, stdout: out, stderr: err, timedOut: timedOut || incomplete))
         }
         guard let c else { return }
@@ -147,9 +160,8 @@ private final class RunState: @unchecked Sendable {
             err = Data()
             return hs
         }
-        for h in hs {
-            h.readabilityHandler = nil
-            try? h.close()
-        }
+        // Only stop the handlers. Closing here could race a read callback that's already running (a read on a closed
+        // descriptor raises); each handle closes its descriptor when its last reference goes.
+        for h in hs { h.readabilityHandler = nil }
     }
 }

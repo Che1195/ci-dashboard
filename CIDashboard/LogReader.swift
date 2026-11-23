@@ -93,7 +93,12 @@ enum LogReader {
         }
         var physical = String(decoding: data, as: UTF8.self).components(separatedBy: "\n")
         if physical.last == "" { physical.removeLast() }          // the file's final newline
-        if offset > 0, !physical.isEmpty { physical.removeFirst() } // a partial first line
+        // The first line is partial unless it starts the file or follows a newline just before what we read.
+        if offset > 0, !physical.isEmpty {
+            try handle.seek(toOffset: offset - 1)
+            let before = try handle.read(upToCount: 1) ?? Data()
+            if before.first != 0x0A { physical.removeFirst() }
+        }
         return Array(physical.suffix(lineCount))
     }
 }

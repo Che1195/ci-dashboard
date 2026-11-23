@@ -13,6 +13,7 @@ struct DashboardView: View {
             header
             Divider()
             if store.settings.repos.isEmpty {
+                if !store.overall.reasons.isEmpty { reasons.padding([.horizontal, .top], 16) }
                 emptyState
             } else {
                 ScrollView {
@@ -317,8 +318,9 @@ struct LaneCard: View {
                 if runner.id != lane.runners.last?.id { Divider().padding(.leading, 34) }
             }
             if lane.runners.isEmpty {
-                Text("No runner registered for this label.")
-                    .font(.caption).foregroundStyle(.red)
+                Text(lane.runnerListComplete ? "No runner registered for this label."
+                                             : "Runner list unavailable, so runners for this label are unknown.")
+                    .font(.caption).foregroundStyle(lane.runnerListComplete ? Color.red : Color.secondary)
                     .padding(.horizontal, 12).padding(.bottom, 8)
             }
         }

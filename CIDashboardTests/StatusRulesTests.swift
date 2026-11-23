@@ -348,6 +348,31 @@ final class StatusRulesTests: XCTestCase {
         XCTAssertEqual(try LogReader.localTail(path: url.path), ["a", "b"])
     }
 
+    func testLaneKnowsWhenRunnerListIsUnavailable() {
+        var snap = RepoSnapshot(repo: "o/r")
+        snap.runnersOK = false
+        snap.runnersComplete = false
+        snap.runs = [(run: run(1, status: "queued"), jobs: [job(1, run: 1, "queued", labels: ["self-hosted", "x"])])]
+        let dash = StatusRules.build(snapshots: [snap], logs: [:], seen: [], now: now)
+        XCTAssertEqual(dash.lanes.first?.runnerListComplete, false)
+    }
+
+    func testLocalTailKeepsCompleteFirstLineAtReadLimit() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("cap-\(UUID()).log")
+        defer { try? FileManager.default.removeItem(at: url) }
+        // "cleanup failed" is the first line inside the 1 MiB window, preceded by a newline; a huge final line follows.
+        let filler = String(repeating: "y", count: Int(LogReader.localReadLimit) - "cleanup failed\n".utf8.count)
+        try ("old line\ncleanup failed\n" + filler).write(to: url, atomically: true, encoding: .utf8)
+        let tail = try LogReader.localTail(path: url.path)
+        XCTAssertEqual(tail.first, "cleanup failed")
+    }
+
+    func testProcessRunnerCapsOutput() async throws {
+        let result = try await ProcessRunner().run("/usr/bin/yes", [], timeout: 3)
+        XCTAssertTrue(result.timedOut)
+        XCTAssertLessThanOrEqual(result.stdout.count, 8 * 1024 * 1024)
+    }
+
     /// Every command the client actually runs, through its real call sites, is `gh api <path>`.
     func testClientCallSitesAreReadOnlyAndPartialFailuresKeepData() async throws {
         let recorder = RecordingRunner { args in

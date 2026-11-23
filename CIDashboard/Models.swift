@@ -144,6 +144,8 @@ struct Lane: Identifiable, Sendable, Equatable {
     let key: String
     var runners: [RunnerRow]
     var queued: [JobInfo]
+    /// False when the repo's runner list failed to load or was cut off, so "no runner" can't be concluded.
+    var runnerListComplete = true
 
     var onlineCount: Int { runners.filter { [.busy, .idle].contains($0.state) }.count }
     var busyCount: Int { runners.filter { $0.state == .busy }.count }

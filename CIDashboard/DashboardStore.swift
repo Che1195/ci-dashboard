@@ -112,10 +112,20 @@ final class DashboardStore {
         let sources = settings.logSources
         let runner = commandRunner
 
+        // A few repos at a time keeps the number of gh processes (and their pipes) bounded.
         async let snaps: [RepoSnapshot] = withTaskGroup(of: (Int, RepoSnapshot).self) { group in
-            for (i, repo) in repos.enumerated() { group.addTask { (i, await client.snapshot(repo)) } }
+            var iterator = repos.enumerated().makeIterator()
+            func addNext() -> Bool {
+                guard let (i, repo) = iterator.next() else { return false }
+                group.addTask { (i, await client.snapshot(repo)) }
+                return true
+            }
+            for _ in 0..<3 where addNext() {}
             var out: [(Int, RepoSnapshot)] = []
-            for await item in group { out.append(item) }
+            for await item in group {
+                out.append(item)
+                _ = addNext()
+            }
             return out.sorted { $0.0 < $1.0 }.map(\.1)
         }
         async let logs = LogReader.readAll(sources, runner: runner)
@@ -125,9 +135,13 @@ final class DashboardStore {
         guard generation == settingsGeneration else { refreshAgain = true; return }
 
         let now = Date()
-        // If GitHub can't be reached at all (gh signed out, network down), say it once.
-        if rateCore == nil, snapshots.allSatisfy({ $0.error != nil }) {
+        // Nothing loaded at all (gh signed out, network down): say it once. A failed rate-limit read alone is its
+        // own, milder reason.
+        let nothingLoaded = snapshots.allSatisfy { !$0.runnersOK && $0.runs.isEmpty }
+        if rateCore == nil && nothingLoaded {
             globalError = "Can't reach GitHub through gh. Check `gh auth status` and the network."
+        } else if rateCore == nil {
+            globalError = "Couldn't read the GitHub API rate limit."
         } else {
             globalError = nil
         }
@@ -138,10 +152,13 @@ final class DashboardStore {
     }
 
     private func updateSeen(_ snapshots: [RepoSnapshot], now: Date) {
-        var byKey = Dictionary(seen.map { ("\($0.repo)/\($0.name)", $0) }, uniquingKeysWith: { a, _ in a })
+        // Keyed case-insensitively by repo (GitHub names are); the newest sighting wins.
+        func key(_ repo: String, _ name: String) -> String { "\(repo.lowercased())/\(name)" }
+        var byKey = Dictionary(seen.map { (key($0.repo, $0.name), $0) },
+                               uniquingKeysWith: { a, b in a.lastSeen >= b.lastSeen ? a : b })
         for snap in snapshots where snap.runnersOK {
             for r in snap.runners {
-                byKey["\(snap.repo)/\(r.name)"] = SeenRunner(
+                byKey[key(snap.repo, r.name)] = SeenRunner(
                     repo: snap.repo, name: r.name, labels: r.labels.map(\.name), os: r.os, lastSeen: now)
             }
         }
