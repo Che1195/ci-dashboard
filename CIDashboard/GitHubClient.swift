@@ -78,28 +78,63 @@ struct GitHubClient: Sendable {
 
     // MARK: Snapshot
 
-    /// One repo's runners plus every queued, waiting or in-progress run with its jobs.
+    static let jobFetchConcurrency = 6
+
+    private func attempt<T: Sendable>(_ body: @Sendable () async throws -> T) async -> Result<T, Error> {
+        do { return .success(try await body()) } catch { return .failure(error) }
+    }
+
+    /// One repo's runners plus every queued, waiting or in-progress run with its jobs. Each part fails on its own:
+    /// what was read is kept, and `error` names what wasn't.
     func snapshot(_ repo: String) async -> RepoSnapshot {
         var snap = RepoSnapshot(repo: repo)
-        do {
-            async let runners = self.runners(repo)
-            async let queued = self.runs(repo, status: "queued")
-            async let waiting = self.runs(repo, status: "waiting")
-            async let inProgress = self.runs(repo, status: "in_progress")
-            snap.runners = try await runners
-            var seen = Set<Int>()
-            let allRuns = try await (queued + waiting + inProgress).filter { seen.insert($0.id).inserted }
-            snap.runs = try await withThrowingTaskGroup(of: (Int, APIRun, [APIJob]).self) { group in
-                for (index, run) in allRuns.enumerated() {
-                    group.addTask { (index, run, try await self.jobs(repo, runID: run.id)) }
-                }
-                var collected: [(Int, APIRun, [APIJob])] = []
-                for try await item in group { collected.append(item) }
-                return collected.sorted { $0.0 < $1.0 }.map { (run: $0.1, jobs: $0.2) }
-            }
-        } catch {
-            snap.error = "\(repo): \(error.localizedDescription)"
+        var errors: [String] = []
+
+        async let runnerList = attempt { try await self.get("repos/\(repo)/actions/runners?per_page=100", as: APIRunnerList.self) }
+        async let queued = attempt { try await self.runs(repo, status: "queued") }
+        async let waiting = attempt { try await self.runs(repo, status: "waiting") }
+        async let inProgress = attempt { try await self.runs(repo, status: "in_progress") }
+
+        switch await runnerList {
+        case .success(let list):
+            snap.runners = list.runners
+            snap.runnersComplete = list.total_count <= list.runners.count
+        case .failure(let error):
+            snap.runnersOK = false
+            snap.runnersComplete = false
+            errors.append("runners: \(error.localizedDescription)")
         }
+
+        var allRuns: [APIRun] = []
+        var seen = Set<Int>()
+        for (label, result) in [("queued", await queued), ("waiting", await waiting), ("in progress", await inProgress)] {
+            switch result {
+            case .success(let runs): allRuns += runs.filter { seen.insert($0.id).inserted }
+            case .failure(let error): errors.append("\(label) runs: \(error.localizedDescription)")
+            }
+        }
+
+        // Jobs for each run, a few at a time; a failed run is left out and counted.
+        let results: [(Int, APIRun, [APIJob]?)] = await withTaskGroup(of: (Int, APIRun, [APIJob]?).self) { group in
+            var iterator = allRuns.enumerated().makeIterator()
+            func addNext() -> Bool {
+                guard let (index, run) = iterator.next() else { return false }
+                group.addTask { (index, run, try? await self.jobs(repo, runID: run.id)) }
+                return true
+            }
+            for _ in 0..<Self.jobFetchConcurrency where addNext() {}
+            var out: [(Int, APIRun, [APIJob]?)] = []
+            for await item in group {
+                out.append(item)
+                _ = addNext()
+            }
+            return out.sorted { $0.0 < $1.0 }
+        }
+        let failedJobs = results.filter { $0.2 == nil }.count
+        if failedJobs > 0 { errors.append("jobs for \(failedJobs) run\(failedJobs == 1 ? "" : "s") couldn't be read") }
+        snap.runs = results.compactMap { item in item.2.map { (run: item.1, jobs: $0) } }
+
+        if !errors.isEmpty { snap.error = "\(repo): " + errors.joined(separator: "; ") }
         return snap
     }
 }

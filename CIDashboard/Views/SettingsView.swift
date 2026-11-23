@@ -66,7 +66,7 @@ private struct ReposSettings: View {
                     HStack {
                         Text(repo).font(.body.monospaced())
                         Spacer()
-                        Button("Add") { store.settings.repos.append(repo) }
+                        Button("Add") { store.addRepo(repo) }
                     }
                 }
             } header: {
@@ -82,7 +82,7 @@ private struct ReposSettings: View {
     private func add() {
         guard let repo = AppSettings.normalizeRepo(newRepo) else { invalid = true; return }
         invalid = false
-        if !store.settings.repos.contains(repo) { store.settings.repos.append(repo) }
+        store.addRepo(repo)
         newRepo = ""
     }
 }

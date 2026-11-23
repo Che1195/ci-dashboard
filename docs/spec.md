@@ -35,7 +35,8 @@ local file or runs `ssh <host> tail -n <N> <path>`. A unit test checks that ever
   (`ssh -o BatchMode=yes -o ConnectTimeout=5`, 8 s overall timeout, last 200 lines). Each source has a *hold pattern*
   (default `cleanup failed`) and a *clear pattern* (default `cleanup succeeded|waiting for a job|Running job|Listening for Jobs`).
   The runner is **holding** when the most recent line matching either pattern matches the hold pattern. The last log
-  line and its age show on the runner row. Log reads that fail show "log unreadable" and never change other status.
+  line shows on the runner row (runner logs carry their own timestamps, which serve as its age). One source per runner
+  name: the first wins. SSH runs with forwarding and local commands off, and `tail -n 200 -- '<path>'`. Log reads that fail show "log unreadable" and never change other status.
 - **Ephemeral runners** (they vanish from the API between jobs): runners seen in the last 24 h but missing now show as
   *not registered*, greyed, with "last seen", instead of disappearing.
 
@@ -49,16 +50,20 @@ local file or runs `ssh <host> tail -n <N> <path>`. A unit test checks that ever
 | Not registered | seen in the last 24 h, absent now |
 
 Overall (menu-bar icon):
-- **Red:** any runner holding, any job queued over 10 min, or a lane with queued jobs and no online runner.
+- **Red:** any runner holding, any job queued over 10 min, or a queued self-hosted job that no online runner in its
+  repo can take (a runner can take a job when it carries every label the job asks for, ignoring case). A job counts as
+  self-hosted when it asks for `self-hosted` or for labels a known self-hosted runner carries.
 - **Orange:** any job queued over 3 min, or a GitHub/`gh` error on the last refresh.
-- **Blue (working):** something running, nothing above.
+- **Blue (working):** something running or queued, nothing above.
 - **Green:** idle, nothing queued.
 
 ## Data (per repo, per refresh)
 - `GET /repos/{r}/actions/runners?per_page=100`
 - `GET /repos/{r}/actions/runs?status=queued&per_page=50`, `…status=in_progress…`, `…status=waiting…`
 - `GET /repos/{r}/actions/runs/{id}/jobs?per_page=100` for each queued or in-progress run
-About 5 + N calls per repo per refresh; at 30 s with one busy repo, roughly 1,000 calls/hour of the 5,000-hour limit.
+Each part is fetched on its own: a failed part is named in an orange reason and the parts that loaded still show.
+Remembered runners show as *not registered* only when the runner list loaded in full. Jobs are fetched six runs at a
+time. About 5 + N calls per repo per refresh; at 30 s with one busy repo, roughly 1,000 calls/hour of the 5,000-hour limit.
 Rate-limit remaining is shown in the footer.
 
 ## Exclusions (v1)

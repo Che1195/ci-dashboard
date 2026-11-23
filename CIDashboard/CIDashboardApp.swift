@@ -93,8 +93,11 @@ enum Snapshotter {
         let args = CommandLine.arguments
         guard let i = args.firstIndex(of: "--snapshot-to"), i + 1 < args.count else { return }
         let path = args[i + 1]
-        while store.lastRefresh == nil { try? await Task.sleep(for: .milliseconds(250)) }
-        try? await Task.sleep(for: .seconds(1.5))
+        // Wait for the first refresh attempt (failed ones count, so a missing gh still produces a picture).
+        while store.refreshAttempts == 0 {
+            do { try await Task.sleep(for: .milliseconds(250)) } catch { return }
+        }
+        do { try await Task.sleep(for: .seconds(1.5)) } catch { return }
         guard let window = NSApp.windows.first(where: { $0.identifier?.rawValue.contains("dashboard") == true || $0.title == "CI Dashboard" }),
               let view = window.contentView?.superview ?? window.contentView,
               let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }

@@ -10,6 +10,7 @@ final class DashboardStore {
             SettingsStore.save(settings)
             if settings.repos != oldValue.repos || settings.logSources != oldValue.logSources
                 || settings.ghPath != oldValue.ghPath {
+                settingsGeneration += 1
                 Task { await refresh() }
             }
             if settings.refreshSeconds != oldValue.refreshSeconds || settings.hourlyDiscovery != oldValue.hourlyDiscovery {
@@ -22,6 +23,10 @@ final class DashboardStore {
     private(set) var isRefreshing = false
     private(set) var globalError: String?
     private(set) var rateLimit: APIRateLimit.Core?
+    /// Finished refresh attempts, failed ones included.
+    private(set) var refreshAttempts = 0
+    private var settingsGeneration = 0
+    private var refreshAgain = false
 
     // Discovery
     private(set) var discovered: [String] = []
@@ -36,14 +41,21 @@ final class DashboardStore {
 
     init(commandRunner: CommandRunning = ProcessRunner()) {
         self.commandRunner = commandRunner
-        settings = SettingsStore.load()
+        var loaded = SettingsStore.load()
+        loaded.repos = AppSettings.uniqueRepos(loaded.repos)
+        settings = loaded
         seen = SettingsStore.loadSeen()
-        startLoops()
+        // The unit-test host launches the app; don't poll GitHub from tests.
+        if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil { startLoops() }
     }
 
+    /// The dashboard's status, with a GitHub/gh error added on top (it never hides a red).
     var overall: OverallStatus {
-        if globalError != nil { return OverallStatus(level: .orange, reasons: [globalError!]) }
-        return dashboard.overall
+        guard let globalError else { return dashboard.overall }
+        var status = dashboard.overall
+        status.level = max(status.level, .orange)
+        status.reasons.insert(globalError, at: 0)
+        return status
     }
 
     private func client() -> GitHubClient? {
@@ -71,11 +83,20 @@ final class DashboardStore {
         }
     }
 
+    /// Refreshes now. A call during a refresh asks for one more pass when it ends, so the latest settings always win.
     func refresh() async {
-        guard !isRefreshing else { return }
+        if isRefreshing { refreshAgain = true; return }
         isRefreshing = true
-        defer { isRefreshing = false }
+        repeat {
+            refreshAgain = false
+            await refreshOnce()
+        } while refreshAgain
+        isRefreshing = false
+        refreshAttempts += 1
+    }
 
+    private func refreshOnce() async {
+        let generation = settingsGeneration
         guard let client = client() else {
             globalError = GitHubError.ghNotFound.localizedDescription
             return
@@ -93,10 +114,12 @@ final class DashboardStore {
         async let logs = LogReader.readAll(sources, runner: runner)
         async let rate = try? client.rateLimit()
         let (snapshots, logStatus, rateCore) = await (snaps, logs, rate)
+        // Settings changed while we were fetching: drop this result and fetch again.
+        guard generation == settingsGeneration else { refreshAgain = true; return }
 
         let now = Date()
-        // If every repo failed the same way (gh signed out, network down), say it once.
-        if !snapshots.isEmpty, snapshots.allSatisfy({ $0.error != nil }), rateCore == nil {
+        // If GitHub can't be reached at all (gh signed out, network down), say it once.
+        if rateCore == nil, snapshots.allSatisfy({ $0.error != nil }) {
             globalError = "Can't reach GitHub through gh. Check `gh auth status` and the network."
         } else {
             globalError = nil
@@ -109,15 +132,15 @@ final class DashboardStore {
 
     private func updateSeen(_ snapshots: [RepoSnapshot], now: Date) {
         var byKey = Dictionary(seen.map { ("\($0.repo)/\($0.name)", $0) }, uniquingKeysWith: { a, _ in a })
-        for snap in snapshots where snap.error == nil {
+        for snap in snapshots where snap.runnersOK {
             for r in snap.runners {
                 byKey["\(snap.repo)/\(r.name)"] = SeenRunner(
                     repo: snap.repo, name: r.name, labels: r.labels.map(\.name), os: r.os, lastSeen: now)
             }
         }
-        let repos = Set(settings.repos)
+        let repos = Set(settings.repos.map { $0.lowercased() })
         seen = byKey.values
-            .filter { repos.contains($0.repo) && now.timeIntervalSince($0.lastSeen) < StatusRules.rememberRunnersFor }
+            .filter { repos.contains($0.repo.lowercased()) && now.timeIntervalSince($0.lastSeen) < StatusRules.rememberRunnersFor }
             .sorted { $0.name < $1.name }
         SettingsStore.saveSeen(seen)
     }
@@ -155,5 +178,13 @@ final class DashboardStore {
         }
     }
 
-    var newDiscoveries: [String] { discovered.filter { !settings.repos.contains($0) } }
+    var newDiscoveries: [String] {
+        let watched = Set(settings.repos.map { $0.lowercased() })
+        return discovered.filter { !watched.contains($0.lowercased()) }
+    }
+
+    /// Adds a repo unless it's already watched (GitHub names are case-insensitive).
+    func addRepo(_ repo: String) {
+        settings.repos = AppSettings.uniqueRepos(settings.repos + [repo])
+    }
 }

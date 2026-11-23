@@ -11,8 +11,9 @@ enum StatusRules {
     static let queuedAlarmAfter: TimeInterval = 10 * 60
     static let rememberRunnersFor: TimeInterval = 24 * 60 * 60
 
+    /// Custom labels, lowercased (GitHub matches labels case-insensitively) and sorted.
     static func customLabels(_ labels: [String]) -> [String] {
-        labels.filter { !genericLabels.contains($0.lowercased()) }.sorted()
+        Array(Set(labels.map { $0.lowercased() }).subtracting(genericLabels)).sorted()
     }
 
     static func laneKey(_ labels: [String]) -> String {
@@ -46,9 +47,16 @@ enum StatusRules {
 
     /// Does a runner with `runnerLabels` satisfy a job asking for `jobLabels`?
     static func runner(_ runnerLabels: [String], satisfies jobLabels: [String]) -> Bool {
+        guard !jobLabels.isEmpty else { return false }
         let have = Set(runnerLabels.map { $0.lowercased() })
         return jobLabels.allSatisfy { have.contains($0.lowercased()) }
     }
+
+    static func asksForSelfHosted(_ labels: [String]) -> Bool {
+        labels.contains { $0.caseInsensitiveCompare("self-hosted") == .orderedSame }
+    }
+
+    static func isTakingJobs(_ state: RunnerState) -> Bool { state == .busy || state == .idle }
 
     static func jobInfo(repo: String, run: APIRun, job: APIJob) -> JobInfo {
         let steps = job.steps ?? []
@@ -65,7 +73,8 @@ enum StatusRules {
             currentStep: current?.name,
             stepNumber: current?.number,
             stepCount: steps.isEmpty ? nil : steps.count,
-            url: job.html_url ?? run.html_url)
+            url: job.html_url ?? run.html_url,
+            isSelfHosted: asksForSelfHosted(job.labels))
     }
 
     /// Builds what the dashboard shows from raw snapshots, log results and remembered runners.
@@ -88,7 +97,7 @@ enum StatusRules {
                         id: -run.id, repo: snap.repo, workflow: run.name ?? "Workflow",
                         branch: run.head_branch ?? "", name: "Waiting to start", runnerName: nil,
                         labels: [], createdAt: run.created_at, startedAt: nil, currentStep: nil,
-                        stepNumber: nil, stepCount: nil, url: run.html_url))
+                        stepNumber: nil, stepCount: nil, url: run.html_url, isSelfHosted: false))
                 }
                 for job in jobs {
                     switch job.status {
@@ -98,22 +107,19 @@ enum StatusRules {
                     }
                 }
             }
-            dash.running += running
-            dash.queued += queued
 
-            // Runners: live ones plus remembered ones that have gone away (ephemeral runners).
+            // Runners: live ones, plus remembered ones that have gone away (ephemeral runners) when the live list
+            // is known to be complete.
             var rows: [RunnerRow] = []
             let liveNames = Set(snap.runners.map(\.name))
             for r in snap.runners {
-                let labels = r.labels.map(\.name)
                 let log = logs[r.name]
-                let job = running.first { $0.runnerName == r.name }
                 rows.append(RunnerRow(
-                    repo: snap.repo, name: r.name, os: r.os, labels: labels,
+                    repo: snap.repo, name: r.name, os: r.os, labels: r.labels.map(\.name),
                     state: runnerState(status: r.status, busy: r.busy, holding: log?.holding),
-                    currentJob: job, log: log, lastSeen: now))
+                    currentJob: running.first { $0.runnerName == r.name }, log: log, lastSeen: now))
             }
-            if snap.error == nil {
+            if snap.runnersOK && snap.runnersComplete {
                 for s in seen where s.repo == snap.repo && !liveNames.contains(s.name)
                     && now.timeIntervalSince(s.lastSeen) < rememberRunnersFor {
                     let log = logs[s.name]
@@ -124,23 +130,40 @@ enum StatusRules {
                 }
             }
 
-            // Lanes from runners' custom labels.
+            // A job is self-hosted if it asks for it, or a known self-hosted runner here has every label it needs.
+            func classify(_ job: inout JobInfo) {
+                if !job.isSelfHosted { job.isSelfHosted = rows.contains { runner($0.labels, satisfies: job.labels) } }
+            }
+            for i in running.indices { classify(&running[i]) }
+            for i in queued.indices {
+                classify(&queued[i])
+                let job = queued[i]
+                if job.isSelfHosted {
+                    queued[i].stranded = !rows.contains { isTakingJobs($0.state) && runner($0.labels, satisfies: job.labels) }
+                }
+            }
+
+            // Lanes group runners by their custom labels.
             var lanes: [String: Lane] = [:]
             for row in rows {
                 let key = laneKey(row.labels)
                 lanes[key, default: Lane(repo: snap.repo, key: key, runners: [], queued: [])].runners.append(row)
             }
-            // Each self-hosted queued job joins the lane whose runners can take it, else a lane of its own.
+            // A queued self-hosted job shows under a lane that can take it, preferring one with a runner taking jobs.
             for job in queued where job.isSelfHosted {
-                if let key = lanes.keys.sorted().first(where: { key in
+                let eligible = lanes.keys.sorted().filter { key in
                     lanes[key]!.runners.contains { runner($0.labels, satisfies: job.labels) }
-                }) {
-                    lanes[key]!.queued.append(job)
-                } else {
-                    let key = laneKey(job.labels)
-                    lanes[key, default: Lane(repo: snap.repo, key: key, runners: [], queued: [])].queued.append(job)
                 }
+                let staffed = eligible.first { key in
+                    lanes[key]!.runners.contains { isTakingJobs($0.state) && runner($0.labels, satisfies: job.labels) }
+                }
+                let key = staffed ?? eligible.first ?? laneKey(job.labels)
+                lanes[key, default: Lane(repo: snap.repo, key: key, runners: [], queued: [])].queued.append(job)
+                if job.stranded { dash.stranded[laneKey(job.labels), default: 0] += 1 }
             }
+
+            dash.running += running
+            dash.queued += queued
             dash.lanes += lanes.values.sorted { $0.key < $1.key }.map { lane in
                 var lane = lane
                 lane.runners.sort { $0.name < $1.name }
@@ -166,21 +189,28 @@ enum StatusRules {
             for r in lane.runners where r.state == .holding {
                 raise(.red, "\(r.name) is holding after a failed cleanup")
             }
-            if !lane.queued.isEmpty && lane.onlineCount == 0 {
-                raise(.red, "\(lane.key): \(lane.queued.count) queued, no runner online")
-            }
+        }
+        for (needs, count) in dash.stranded.sorted(by: { $0.key < $1.key }) {
+            raise(.red, "\(count) queued for \(needs), no runner online that can take \(count == 1 ? "it" : "them")")
         }
         if let oldest = dash.queued.first {
             let waited = now.timeIntervalSince(oldest.createdAt)
-            if waited >= queuedAlarmAfter {
+            if waited > queuedAlarmAfter {
                 raise(.red, "\(oldest.name) queued \(Format.duration(waited))")
-            } else if waited >= queuedWarnAfter {
+            } else if waited > queuedWarnAfter {
                 raise(.orange, "\(oldest.name) queued \(Format.duration(waited))")
             }
         }
         for error in dash.repoErrors { raise(.orange, error) }
-        if level == .green && !dash.running.isEmpty { level = .blue }
+        // Green means idle with nothing queued; any work in flight is at least blue.
+        if level == .green && (!dash.running.isEmpty || !dash.queued.isEmpty) { level = .blue }
         return OverallStatus(level: level, reasons: reasons)
+    }
+
+    static func queueColorLevel(waited: TimeInterval) -> OverallLevel {
+        if waited > queuedAlarmAfter { return .red }
+        if waited > queuedWarnAfter { return .orange }
+        return .green
     }
 }
 

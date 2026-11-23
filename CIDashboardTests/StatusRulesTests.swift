@@ -38,9 +38,11 @@ final class StatusRulesTests: XCTestCase {
 
     func testSSHOnlyRunsTailInBatchMode() {
         let args = LogReader.sshArguments(host: "mini.local", path: "/var/log/it's.log")
-        XCTAssertTrue(args.contains("BatchMode=yes"))
-        XCTAssertTrue(args.contains("ConnectTimeout=5"))
-        XCTAssertEqual(args.last, "tail -n 200 '/var/log/it'\\''s.log'")
+        for option in ["BatchMode=yes", "ConnectTimeout=5", "ClearAllForwardings=yes", "PermitLocalCommand=no"] {
+            XCTAssertTrue(args.contains(option), option)
+        }
+        XCTAssertEqual(args.last, "tail -n 200 -- '/var/log/it'\\''s.log'")
+        XCTAssertEqual(LogReader.sshArguments(host: "h", path: "-n").last, "tail -n 200 -- '-n'")
         XCTAssertEqual(args[args.count - 2], "mini.local")
         XCTAssertEqual(args[args.count - 3], "--")
     }
@@ -157,9 +159,11 @@ final class StatusRulesTests: XCTestCase {
                           jobs: [job(1, run: 1, "queued", labels: ["self-hosted", "tt-web"], created: -seconds)])]
             return StatusRules.build(snapshots: [snap], logs: [:], seen: [], now: now).overall.level
         }
-        XCTAssertEqual(level(queuedFor: 60), .green)
-        XCTAssertEqual(level(queuedFor: 4 * 60), .orange)
-        XCTAssertEqual(level(queuedFor: 11 * 60), .red)
+        XCTAssertEqual(level(queuedFor: 60), .blue)        // queued but young: work in flight, not "all clear"
+        XCTAssertEqual(level(queuedFor: 180), .blue)       // "over 3 minutes" is strict
+        XCTAssertEqual(level(queuedFor: 181), .orange)
+        XCTAssertEqual(level(queuedFor: 600), .orange)     // "over 10 minutes" is strict
+        XCTAssertEqual(level(queuedFor: 601), .red)
     }
 
     func testRunningOnlyIsBlue() {
@@ -202,5 +206,147 @@ final class StatusRulesTests: XCTestCase {
         let list = try GitHubClient.decoder.decode(APIJobList.self, from: Data(json.utf8))
         XCTAssertEqual(list.jobs.first?.runner_name, "mac-runner-1")
         XCTAssertEqual(list.jobs.first?.steps?.first?.name, "UI tests")
+    }
+
+    // MARK: Review fixes
+
+    func testJobGoesToStaffedLaneNotOfflineOne() {
+        var snap = RepoSnapshot(repo: "o/r")
+        snap.runners = [
+            runner("gpu-old", "offline", busy: false, labels: ["self-hosted", "gpu"]),
+            runner("gpu-big", "online", busy: true, labels: ["self-hosted", "gpu", "large"]),
+        ]
+        snap.runs = [(run: run(1, status: "queued"), jobs: [job(1, run: 1, "queued", labels: ["self-hosted", "gpu"])])]
+        let dash = StatusRules.build(snapshots: [snap], logs: [:], seen: [], now: now)
+        XCTAssertEqual(dash.lanes.first { $0.key == "gpu + large" }?.queued.map(\.id), [1])
+        XCTAssertTrue(dash.stranded.isEmpty)
+        XCTAssertEqual(dash.overall.level, .blue)
+    }
+
+    func testJobNeedingMacOSIsStrandedWhenOnlyLinuxIsOnline() {
+        var snap = RepoSnapshot(repo: "o/r")
+        snap.runners = [
+            runner("mac", "offline", busy: false, labels: ["self-hosted", "macOS", "build"]),
+            runner("lin", "online", busy: false, labels: ["self-hosted", "Linux", "build"]),
+        ]
+        snap.runs = [(run: run(1, status: "queued"),
+                      jobs: [job(1, run: 1, "queued", labels: ["self-hosted", "macOS", "build"])])]
+        let dash = StatusRules.build(snapshots: [snap], logs: [:], seen: [], now: now)
+        XCTAssertEqual(dash.queued.first?.stranded, true)
+        XCTAssertEqual(dash.overall.level, .red)
+    }
+
+    func testCustomLabelOnlyJobCountsAsSelfHosted() {
+        var snap = RepoSnapshot(repo: "o/r")
+        snap.runners = [runner("w", "offline", busy: false, labels: ["self-hosted", "Linux", "TT-Web"])]
+        snap.runs = [(run: run(1, status: "queued"), jobs: [job(1, run: 1, "queued", labels: ["tt-web"])])]
+        let dash = StatusRules.build(snapshots: [snap], logs: [:], seen: [], now: now)
+        XCTAssertEqual(dash.queued.first?.isSelfHosted, true)
+        XCTAssertEqual(dash.lanes.map(\.key), ["tt-web"])
+        XCTAssertEqual(dash.lanes.first?.queued.count, 1)
+        XCTAssertEqual(dash.overall.level, .red)
+    }
+
+    func testHostedJobIsNotStranded() {
+        var snap = RepoSnapshot(repo: "o/r")
+        snap.runs = [(run: run(1, status: "queued"), jobs: [job(1, run: 1, "queued", labels: ["ubuntu-24.04"])])]
+        let dash = StatusRules.build(snapshots: [snap], logs: [:], seen: [], now: now)
+        XCTAssertEqual(dash.queued.first?.isSelfHosted, false)
+        XCTAssertTrue(dash.lanes.isEmpty)
+        XCTAssertEqual(dash.overall.level, .blue)
+    }
+
+    func testIncompleteRunnerListDoesNotInventAbsences() {
+        var snap = RepoSnapshot(repo: "o/r")
+        snap.runners = [runner("a", "online", busy: false, labels: ["self-hosted", "x"])]
+        snap.runnersComplete = false
+        let seen = [SeenRunner(repo: "o/r", name: "b", labels: ["self-hosted", "x"], os: nil, lastSeen: now)]
+        let dash = StatusRules.build(snapshots: [snap], logs: [:], seen: seen, now: now)
+        XCTAssertEqual(dash.lanes.flatMap(\.runners).map(\.name), ["a"])
+    }
+
+    func testUniqueReposAndLogSources() {
+        XCTAssertEqual(AppSettings.uniqueRepos(["A/b", "a/B", "c/d"]), ["A/b", "c/d"])
+        var first = LogSource(); first.runnerName = "r"; first.path = "/one"
+        var second = LogSource(); second.runnerName = "r"; second.path = "/two"
+        var blank = LogSource(); blank.runnerName = "x"
+        XCTAssertEqual(LogReader.uniqueSources([first, second, blank]).map(\.path), ["/one"])
+    }
+
+    func testLocalTailReadsPastOneChunk() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("tail-\(UUID()).log")
+        defer { try? FileManager.default.removeItem(at: url) }
+        // A hold marker 150 lines from the end, behind lines long enough to push it past 64 KiB.
+        var lines = (0..<50).map { "early \($0)" }
+        lines.append("cleanup failed: not taking jobs")
+        lines += (0..<150).map { "noise \($0) " + String(repeating: "x", count: 1000) }
+        try (lines.joined(separator: "\n") + "\n\n").write(to: url, atomically: true, encoding: .utf8)
+        let tail = try LogReader.localTail(path: url.path)
+        XCTAssertEqual(tail.count, 200)
+        XCTAssertEqual(StatusRules.isHolding(lines: tail, holdPattern: LogSource.defaultHold, clearPattern: "never-matches"), true)
+    }
+
+    func testProcessRunnerTimesOutAndReturns() async throws {
+        let start = Date()
+        let result = try await ProcessRunner().run("/bin/sleep", ["30"], timeout: 1)
+        XCTAssertTrue(result.timedOut)
+        XCTAssertLessThan(Date().timeIntervalSince(start), 6)
+    }
+
+    func testProcessRunnerCollectsOutput() async throws {
+        let result = try await ProcessRunner().run("/bin/echo", ["hello"], timeout: 5)
+        XCTAssertEqual(result.status, 0)
+        XCTAssertFalse(result.timedOut)
+        XCTAssertEqual(String(decoding: result.stdout, as: UTF8.self), "hello\n")
+    }
+
+    /// Every command the client actually runs, through its real call sites, is `gh api <path>`.
+    func testClientCallSitesAreReadOnlyAndPartialFailuresKeepData() async throws {
+        let recorder = RecordingRunner { args in
+            let path = args.last ?? ""
+            if path.contains("/runners") { return #"{"total_count":1,"runners":[{"id":1,"name":"w","os":"Linux","status":"online","busy":true,"labels":[{"name":"self-hosted"}]}]}"# }
+            if path.contains("status=in_progress") { return #"{"workflow_runs":[{"id":10,"name":"CI","head_branch":"main","status":"in_progress","created_at":"2026-11-23T10:00:00Z"},{"id":11,"name":"CI","head_branch":"x","status":"in_progress","created_at":"2026-11-23T10:00:00Z"}]}"# }
+            if path.contains("status=") { return #"{"workflow_runs":[]}"# }
+            if path.contains("runs/10/jobs") { return #"{"jobs":[{"id":100,"run_id":10,"name":"build","status":"in_progress","created_at":"2026-11-23T10:00:00Z","started_at":"2026-11-23T10:01:00Z","runner_name":"w","labels":["self-hosted"],"steps":[]}]}"# }
+            if path == "rate_limit" { return #"{"resources":{"core":{"limit":5000,"remaining":4999,"reset":0}}}"# }
+            if path.hasPrefix("user/repos") { return #"[{"full_name":"o/r","archived":false}]"# }
+            return nil // runs/11/jobs fails
+        }
+        let client = GitHubClient(ghPath: "/usr/bin/gh", runner: recorder)
+        let snap = await client.snapshot("o/r")
+        _ = try await client.rateLimit()
+        _ = try await client.ownedRepos()
+        _ = try await client.selfHostedRunnerCount("o/r")
+
+        XCTAssertEqual(snap.runners.map(\.name), ["w"])
+        XCTAssertEqual(snap.runs.map(\.run.id), [10], "the run whose jobs loaded is kept")
+        XCTAssertTrue(snap.runnersOK)
+        XCTAssertNotNil(snap.error)
+
+        let calls = recorder.calls
+        XCTAssertGreaterThanOrEqual(calls.count, 9)
+        for call in calls {
+            XCTAssertEqual(call.executable, "/usr/bin/gh")
+            XCTAssertEqual(call.arguments.count, 2, "\(call.arguments)")
+            XCTAssertEqual(call.arguments.first, "api")
+        }
+    }
+}
+
+final class RecordingRunner: CommandRunning, @unchecked Sendable {
+    struct Call { let executable: String; let arguments: [String] }
+    private let lock = NSLock()
+    private var _calls: [Call] = []
+    private let respond: @Sendable ([String]) -> String?
+
+    init(_ respond: @escaping @Sendable ([String]) -> String?) { self.respond = respond }
+    var calls: [Call] { lock.withLock { _calls } }
+
+    func run(_ executable: String, _ arguments: [String], timeout: TimeInterval) async throws -> CommandResult {
+        lock.withLock { _calls.append(Call(executable: executable, arguments: arguments)) }
+        if let body = respond(arguments) {
+            return CommandResult(status: 0, stdout: Data(body.utf8), stderr: Data(), timedOut: false)
+        }
+        return CommandResult(status: 1, stdout: Data(), stderr: Data("HTTP 502".utf8), timedOut: false)
     }
 }

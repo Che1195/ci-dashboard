@@ -76,6 +76,10 @@ struct RepoSnapshot: Sendable {
     /// Runs that are queued, waiting or in progress, with their jobs.
     var runs: [(run: APIRun, jobs: [APIJob])] = []
     var error: String?
+    /// The runner list was read. Without it, remembered runners and new sightings are left alone.
+    var runnersOK = true
+    /// Every registered runner is in `runners` (not cut off by paging), so a missing one really is missing.
+    var runnersComplete = true
 }
 
 struct JobInfo: Identifiable, Sendable, Equatable {
@@ -92,8 +96,10 @@ struct JobInfo: Identifiable, Sendable, Equatable {
     let stepNumber: Int?
     let stepCount: Int?
     let url: String?
-
-    var isSelfHosted: Bool { labels.contains { $0.caseInsensitiveCompare("self-hosted") == .orderedSame } }
+    /// Asks for `self-hosted`, or for labels a known self-hosted runner in the repo carries.
+    var isSelfHosted: Bool
+    /// Self-hosted, and no online runner in the repo has every label it asks for.
+    var stranded = false
 }
 
 enum RunnerState: String, Sendable, Equatable {
@@ -156,6 +162,8 @@ struct Dashboard: Sendable, Equatable {
     var running: [JobInfo] = []
     var queued: [JobInfo] = []
     var repoErrors: [String] = []
+    /// Queued jobs no online runner can take, counted by the labels they need.
+    var stranded: [String: Int] = [:]
     var overall = OverallStatus(level: .green, reasons: [])
 }
 

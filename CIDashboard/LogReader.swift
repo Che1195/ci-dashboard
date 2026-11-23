@@ -4,10 +4,20 @@ import Foundation
 enum LogReader {
     static let lineCount = 200
 
-    /// The exact ssh arguments used. Tested: always `tail`, batch mode, a connect timeout.
+    static let localReadLimit: UInt64 = 1024 * 1024
+
+    /// The exact ssh arguments used. Tested: always `tail`, batch mode, a connect timeout, no forwarding or local
+    /// commands from the user's ssh config, and `--` so a path starting with `-` stays a file name.
     static func sshArguments(host: String, path: String) -> [String] {
-        ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-T", "--", host,
-         "tail -n \(lineCount) \(shellQuote(path))"]
+        ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "ClearAllForwardings=yes",
+         "-o", "PermitLocalCommand=no", "-o", "ForwardAgent=no", "-o", "ForwardX11=no", "-T", "--", host,
+         "tail -n \(lineCount) -- \(shellQuote(path))"]
+    }
+
+    /// One source per runner name: the first in the list wins, so a duplicate can't flip the result between polls.
+    static func uniqueSources(_ sources: [LogSource]) -> [LogSource] {
+        var seen = Set<String>()
+        return sources.filter { !$0.runnerName.isEmpty && !$0.path.isEmpty && seen.insert($0.runnerName).inserted }
     }
 
     static func shellQuote(_ s: String) -> String {
@@ -16,7 +26,7 @@ enum LogReader {
 
     static func readAll(_ sources: [LogSource], runner: CommandRunning) async -> [String: LogStatus] {
         await withTaskGroup(of: (String, LogStatus).self) { group in
-            for source in sources where !source.runnerName.isEmpty && !source.path.isEmpty {
+            for source in uniqueSources(sources) {
                 group.addTask { (source.runnerName, await read(source, runner: runner)) }
             }
             var out: [String: LogStatus] = [:]
@@ -62,10 +72,21 @@ enum LogReader {
         let handle = try FileHandle(forReadingFrom: URL(fileURLWithPath: path))
         defer { try? handle.close() }
         let size = try handle.seekToEnd()
+        // Read backwards in chunks until there are enough non-empty lines, up to a safety limit.
         let chunk: UInt64 = 64 * 1024
-        try handle.seek(toOffset: size > chunk ? size - chunk : 0)
-        let data = try handle.readToEnd() ?? Data()
+        var offset = size
+        var data = Data()
+        while offset > 0 {
+            let start = offset > chunk ? offset - chunk : 0
+            try handle.seek(toOffset: start)
+            data = (try handle.read(upToCount: Int(offset - start)) ?? Data()) + data
+            offset = start
+            let lines = String(decoding: data, as: UTF8.self).split(separator: "\n", omittingEmptySubsequences: true)
+            // The first line may be partial unless we reached the start of the file.
+            if lines.count > lineCount || size - offset >= localReadLimit { break }
+        }
         let lines = String(decoding: data, as: UTF8.self).components(separatedBy: "\n")
+            .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
         return Array(lines.suffix(lineCount))
     }
 }

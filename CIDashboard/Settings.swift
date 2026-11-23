@@ -46,6 +46,12 @@ struct AppSettings: Codable, Equatable, Sendable {
         hourlyDiscovery = try c.decodeIfPresent(Bool.self, forKey: .hourlyDiscovery) ?? false
     }
 
+    /// Drops repos that repeat an earlier one ignoring case, keeping the first spelling.
+    static func uniqueRepos(_ repos: [String]) -> [String] {
+        var seen = Set<String>()
+        return repos.filter { seen.insert($0.lowercased()).inserted }
+    }
+
     /// `owner/repo`, trimmed; nil if it isn't that shape.
     static func normalizeRepo(_ text: String) -> String? {
         var t = text.trimmingCharacters(in: .whitespacesAndNewlines)
