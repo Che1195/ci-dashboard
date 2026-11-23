@@ -1,0 +1,48 @@
+name: CIDashboard
+options:
+  bundleIdPrefix: io.github.che1195
+  deploymentTarget:
+    macOS: "15.0"
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    CODE_SIGN_STYLE: Automatic
+    CODE_SIGN_IDENTITY: "-"
+    ENABLE_HARDENED_RUNTIME: NO
+targets:
+  CIDashboard:
+    type: application
+    platform: macOS
+    sources: [CIDashboard]
+    info:
+      path: CIDashboard/Info.plist
+      properties:
+        CFBundleDisplayName: CI Dashboard
+        LSUIElement: true
+        LSApplicationCategoryType: public.app-category.developer-tools
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.che1195.CIDashboard
+        PRODUCT_NAME: CI Dashboard
+        GENERATE_INFOPLIST_FILE: NO
+  CIDashboardTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources: [CIDashboardTests]
+    dependencies:
+      - target: CIDashboard
+    settings:
+      base:
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/CI Dashboard.app/Contents/MacOS/CI Dashboard"
+schemes:
+  CIDashboard:
+    build:
+      targets:
+        CIDashboard: all
+        CIDashboardTests: [test]
+    test:
+      targets: [CIDashboardTests]
