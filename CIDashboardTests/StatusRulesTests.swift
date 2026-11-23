@@ -576,7 +576,9 @@ final class StatusRulesTests: XCTestCase {
     }
 
     func testConfirmedHoldsSurviveARelaunch() throws {
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: "holds-\(UUID())"))
+        let suite = "io.github.che1195.CIDashboard.tests"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
         SettingsStore.saveHolds(["mac": now], defaults)
         XCTAssertEqual(SettingsStore.loadHolds(defaults), ["mac": now])
     }
@@ -608,6 +610,338 @@ final class StatusRulesTests: XCTestCase {
         XCTAssertNotEqual(again.error, "previous log read still running")
         XCTAssertEqual(again.holding, false)
     }
+
+    // MARK: Audit 4
+
+    func source(_ name: String, path: String = "/p", host: String = "",
+                hold: String = LogSource.defaultHold, clear: String = LogSource.defaultClear) -> LogSource {
+        var source = LogSource()
+        source.runnerName = name; source.host = host; source.path = path
+        source.holdPattern = hold; source.clearPattern = clear
+        return source
+    }
+
+    /// Finding 1: a refresh that read a source as it was mid-edit proves nothing about that runner.
+    func testEvidenceFromAnEditedSourceIsNotApplied() {
+        let earlier = now.addingTimeInterval(-600)
+        let cleared = LogStatus(holding: false, lastLine: "anything", error: nil)
+        let held = LogStatus(holding: true, lastLine: "cleanup failed", error: nil)
+        func holds(_ logs: [String: LogStatus], read: [LogSource], current: [LogSource], settingsCurrent: Bool = false,
+                   previous: [String: Date]) -> [String: Date] {
+            StatusRules.holdsAfterRefresh(logs, read: read, current: current, settingsCurrent: settingsCurrent,
+                                          previous: previous, now: now).holds
+        }
+
+        // A clear pattern caught half-typed ("…|" matches every line) must not end a real hold.
+        XCTAssertEqual(holds(["mac": cleared], read: [source("mac", clear: "cleanup succeeded|")],
+                             current: [source("mac", clear: "cleanup succeeded|w")], previous: ["mac": earlier]),
+                       ["mac": earlier])
+        // A hold pattern caught half-typed ("c") must not start one.
+        XCTAssertEqual(holds(["mac": held], read: [source("mac", hold: "c")], current: [source("mac", hold: "cl")],
+                             previous: [:]), [:])
+        // The path was empty when the refresh started, or is empty now: the hold stays as it was.
+        XCTAssertEqual(holds([:], read: [source("mac", path: "")], current: [source("mac", path: "/")],
+                             previous: ["mac": earlier]), ["mac": earlier])
+        XCTAssertEqual(holds(["mac": cleared], read: [source("mac")], current: [source("mac", path: "")],
+                             previous: ["mac": earlier]), ["mac": earlier])
+        // Host, path and runner name count too; the row's id doesn't.
+        for edited in [source("mac", host: "mini"), source("mac", path: "/q")] {
+            XCTAssertEqual(holds(["mac": cleared], read: [source("mac")], current: [edited],
+                                 previous: ["mac": earlier]), ["mac": earlier])
+        }
+        XCTAssertEqual(holds(["mac": cleared], read: [source("mac")], current: [source("mac")],
+                             previous: ["mac": earlier]), [:], "a new id with the same fields is the same source")
+        // A row removed, or a runner renamed, while the refresh ran: nothing is dropped until settings are current.
+        XCTAssertEqual(holds(["mac": cleared], read: [source("mac")], current: [], previous: ["mac": earlier]),
+                       ["mac": earlier])
+        XCTAssertEqual(holds(["mac": held], read: [source("mac")], current: [source("mac-2")], previous: ["mac": earlier]),
+                       ["mac": earlier])
+        // With two rows for one runner the first readable one is the source; evidence from the other isn't used.
+        XCTAssertEqual(holds(["mac": cleared], read: [source("mac", path: "/one"), source("mac", path: "/two")],
+                             current: [source("mac", path: ""), source("mac", path: "/two")],
+                             previous: ["mac": earlier]), ["mac": earlier])
+    }
+
+    /// Finding 1, the other half: sources that didn't change are still judged, whatever else was edited.
+    func testEvidenceFromAnUnchangedSourceSurvivesOtherEdits() {
+        let earlier = now.addingTimeInterval(-600)
+        let logs = ["mac": LogStatus(holding: false, lastLine: "cleanup succeeded", error: nil),
+                    "linux": LogStatus(holding: true, lastLine: "cleanup failed", error: nil),
+                    "win": LogStatus(holding: false, lastLine: "x", error: nil)]
+        let read = [source("mac"), source("linux"), source("win", clear: "x|")]
+        let previous = ["mac": earlier, "win": earlier, "gone": earlier]
+
+        // Another runner's row was edited mid-refresh (and so the generation is stale).
+        let edited = StatusRules.holdsAfterRefresh(
+            logs, read: read, current: [source("mac"), source("linux"), source("win", clear: "x|y")],
+            settingsCurrent: false, previous: previous, now: now)
+        XCTAssertEqual(edited.holds, ["linux": now, "win": earlier, "gone": earlier],
+                       "mac's clear and linux's hold count; win is left alone; nothing is pruned")
+
+        // Only a repo was added: every source is unchanged, so every result counts, but pruning waits.
+        let repoAdded = StatusRules.holdsAfterRefresh(
+            logs, read: read, current: read, settingsCurrent: false, previous: previous, now: now)
+        XCTAssertEqual(repoAdded.holds, ["linux": now, "gone": earlier])
+
+        // Settings current: the runner no row names is dropped.
+        let current = StatusRules.holdsAfterRefresh(
+            logs, read: read, current: read, settingsCurrent: true, previous: previous, now: now)
+        XCTAssertEqual(current.holds, ["linux": now])
+        XCTAssertEqual(current.logs["mac"]?.holding, false)
+
+        // Settings current, but mac's row has no path (cleared and left that way): its hold stays and still shows.
+        let pathless = [source("mac", path: ""), source("linux")]
+        let kept = StatusRules.holdsAfterRefresh(
+            ["linux": logs["linux"]!], read: pathless, current: pathless, settingsCurrent: true,
+            previous: ["mac": earlier, "gone": earlier], now: now)
+        XCTAssertEqual(kept.holds, ["mac": earlier, "linux": now])
+        XCTAssertEqual(kept.logs["mac"]?.holding, true)
+        XCTAssertTrue(kept.logs["mac"]?.error?.contains("still holding") ?? false)
+    }
+
+    /// Finding 1 through the store itself: the refresh that read a half-typed clear pattern leaves the hold alone.
+    @MainActor
+    func testStoreKeepsAHoldThroughAHalfTypedPattern() async throws {
+        let suite = "io.github.che1195.CIDashboard.tests"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        var settings = AppSettings()
+        settings.logSources = [source("mac", host: "h", clear: "cleanup succeeded|")]   // "…|" matches every line
+        SettingsStore.save(settings, defaults)
+        SettingsStore.saveHolds(["mac": now], defaults)
+        // The marker has scrolled out: no later read can bring the hold back once it is dropped.
+        let runner = GatedRunner { _ in "just noise\n" }
+        let store = DashboardStore(commandRunner: runner, defaults: defaults)
+
+        let refresh = Task { await store.refresh() }
+        while runner.sshCalls == 0 { try await Task.sleep(for: .milliseconds(5)) }
+        store.settings.logSources[0].clearPattern = "cleanup succeeded|waiting for a job"
+        runner.open()
+        await refresh.value
+        while store.isRefreshing { try await Task.sleep(for: .milliseconds(5)) }
+
+        XCTAssertGreaterThanOrEqual(runner.sshCalls, 2, "the edited source is read again")
+        XCTAssertEqual(SettingsStore.loadHolds(defaults), ["mac": now])
+        XCTAssertEqual(store.overall.level, .red)
+        XCTAssertEqual(store.dashboard.unplacedHolds, ["mac"])
+    }
+
+    /// Finding 1, the other half, through the store: a clear line read while a repo was being added still counts.
+    @MainActor
+    func testStoreKeepsAClearLineThroughAnUnrelatedEdit() async throws {
+        let suite = "io.github.che1195.CIDashboard.tests"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        var settings = AppSettings()
+        settings.logSources = [source("mac", host: "h")]
+        SettingsStore.save(settings, defaults)
+        SettingsStore.saveHolds(["mac": now, "gone": now], defaults)
+        // The clear line is in the first read only; by the second it has scrolled out.
+        let runner = GatedRunner { call in call == 1 ? "cleanup succeeded: taking jobs again\n" : "just noise\n" }
+        let store = DashboardStore(commandRunner: runner, defaults: defaults)
+
+        let refresh = Task { await store.refresh() }
+        while runner.sshCalls == 0 { try await Task.sleep(for: .milliseconds(5)) }
+        store.addRepo("o/r")
+        runner.open()
+        await refresh.value
+        while store.isRefreshing { try await Task.sleep(for: .milliseconds(5)) }
+
+        XCTAssertGreaterThanOrEqual(runner.sshCalls, 2)
+        XCTAssertEqual(SettingsStore.loadHolds(defaults), [:], "mac cleared by the first read; gone has no log source")
+        XCTAssertFalse(store.overall.reasons.contains { $0.contains("holding") })
+    }
+
+    /// Finding 4 through the store: a saved hold is red from the moment the app starts.
+    @MainActor
+    func testStoreStartsWithRestoredHolds() throws {
+        let suite = "io.github.che1195.CIDashboard.tests"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        var settings = AppSettings()
+        settings.logSources = [source("mac")]
+        SettingsStore.save(settings, defaults)
+        SettingsStore.saveHolds(["mac": now, "gone": now], defaults)
+        let store = DashboardStore(commandRunner: HangingRunner(), defaults: defaults)
+        XCTAssertNil(store.lastRefresh)
+        XCTAssertEqual(store.overall.level, .red)
+        XCTAssertEqual(store.overall.reasons.count, 1)
+        XCTAssertTrue(store.overall.reasons.first?.hasPrefix("mac is holding") ?? false)
+        XCTAssertEqual(SettingsStore.loadHolds(defaults).count, 2, "nothing is dropped before a refresh has run")
+    }
+
+    /// Finding 2: a line the writer hasn't finished can't be matched, in a local file or over ssh.
+    func testUnterminatedLastLineIsNotMatched() async throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("partial-\(UUID()).log")
+        defer { try? FileManager.default.removeItem(at: url) }
+        // "cleanup succeeded" is the start of a line that will end " for cache only": not a clear line yet.
+        try "cleanup failed: not taking jobs\ncleanup succeeded".write(to: url, atomically: true, encoding: .utf8)
+        XCTAssertEqual(try LogReader.localTail(path: url.path), ["cleanup failed: not taking jobs"])
+        let partial = await LogReader.read(localSource(url), runner: HangingRunner())
+        XCTAssertEqual(partial.holding, true)
+        XCTAssertEqual(partial.lastLine, "cleanup failed: not taking jobs")
+
+        // Once the line is finished it counts, whatever it turns out to say.
+        try "cleanup failed: not taking jobs\ncleanup succeeded\n".write(to: url, atomically: true, encoding: .utf8)
+        let whole = await LogReader.read(localSource(url), runner: HangingRunner())
+        XCTAssertEqual(whole.holding, false)
+
+        // A file with no finished line has nothing to match.
+        try "cleanup succeeded".write(to: url, atomically: true, encoding: .utf8)
+        XCTAssertEqual(try LogReader.localTail(path: url.path), [])
+        try "".write(to: url, atomically: true, encoding: .utf8)
+        XCTAssertEqual(try LogReader.localTail(path: url.path), [])
+
+        // ssh: `tail` output can end mid-line the same way.
+        let remote = RecordingRunner { _ in "cleanup failed\nnoise\ncleanup succeeded" }
+        let viaSSH = await LogReader.read(source("r", host: "h"), runner: remote)
+        XCTAssertEqual(viaSSH.holding, true)
+        XCTAssertEqual(viaSSH.lastLine, "noise")
+        XCTAssertEqual(LogReader.wholeLines(Data("a\n\nb\n".utf8)), ["a", "", "b"])
+        XCTAssertEqual(LogReader.wholeLines(Data()), [])
+    }
+
+    /// Finding 2: the 200 lines are whole lines, so an unfinished last line doesn't push a marker out or in.
+    func testLocalTailCountsOnlyWholeLines() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("count-\(UUID()).log")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let lines = ["too old", "cleanup failed"] + (1..<200).map { "noise \($0)" }
+        try (lines.joined(separator: "\n") + "\nunfinished").write(to: url, atomically: true, encoding: .utf8)
+        let result = try LogReader.localTailResult(path: url.path)
+        XCTAssertEqual(result.lines.count, 200)
+        XCTAssertEqual(result.lines.first, "cleanup failed")
+        XCTAssertEqual(result.lines.last, "noise 199")
+        XCTAssertTrue(result.complete)
+    }
+
+    /// Finding 3: bytes from a file that changed under the scan are never joined into lines.
+    func testShortOrChangingReadIsRejected() throws {
+        // 300 lines of 1,000 bytes: finding the last 200 takes four 64 KiB chunks.
+        func file(_ word: String) -> Data {
+            Data((0..<300).map { "\(word) \($0) " + String(repeating: "x", count: 1000 - "\(word) \($0) \n".count) + "\n" }.joined().utf8)
+        }
+        let old = file("old"), size = UInt64(old.count)
+        XCTAssertEqual(old.count, 300_000)
+        func slice(_ data: Data, _ offset: UInt64, _ count: Int) -> Data {
+            data.subdata(in: min(data.count, Int(offset))..<min(data.count, Int(offset) + count))
+        }
+
+        // The honest case first, so the failures below are down to what each one breaks.
+        var reads = 0
+        let good = try LogReader.tailResult(size: size) { reads += 1; return slice(old, $0, $1) }
+        XCTAssertEqual(good.lines.count, 200)
+        XCTAssertEqual(good.lines.first?.hasPrefix("old 100 "), true)
+        XCTAssertEqual(good.lines.last?.hasPrefix("old 299 "), true)
+        XCTAssertTrue(good.complete)
+        XCTAssertEqual(reads, 5, "four chunks to find the range, then one read of it")
+
+        // Cut short after the first chunk (the file's end) was read: the next chunk comes back short.
+        XCTAssertThrowsError(try LogReader.tailResult(size: size) { offset, count in
+            offset + UInt64(count) == size ? slice(old, offset, count) : slice(old, offset, count).prefix(count / 2)
+        })
+        // Cut short after the range was found: the one read that is matched comes back short.
+        let cut = old.prefix(250_000)
+        XCTAssertThrowsError(try LogReader.tailResult(size: size) { offset, count in
+            count > 64 * 1024 ? slice(cut, offset, count) : slice(old, offset, count)
+        })
+        // Emptied: every read is short.
+        XCTAssertThrowsError(try LogReader.tailResult(size: size) { _, _ in Data() })
+
+        // Rewritten (same length) after the range was found: every line comes whole from the new file, none is
+        // part old, part new.
+        let new = file("new")
+        let rewritten = try LogReader.tailResult(size: size) { offset, count in
+            slice(count > 64 * 1024 ? new : old, offset, count)
+        }
+        XCTAssertEqual(rewritten.lines.count, 200)
+        XCTAssertTrue(rewritten.lines.allSatisfy { $0.hasPrefix("new ") && $0.count == 999 })
+
+        // Appended to while it was read: what was there when the read started is read as it was.
+        let longer = old + Data("cleanup succeeded\n".utf8)
+        let appended = try LogReader.tailResult(size: size) { slice(longer, $0, $1) }
+        XCTAssertEqual(appended.lines, good.lines)
+
+        // A failed read is "unknown", which keeps a hold.
+        let status = StatusRules.stickyHolds(
+            ["mac": LogStatus(holding: nil, lastLine: nil, error: "log changed while it was being read")],
+            configured: ["mac"], previous: ["mac": now], now: now)
+        XCTAssertEqual(status.holds, ["mac": now])
+    }
+
+    /// Finding 3 on a real file: a log being appended to reads cleanly every time, and never yields a half line.
+    func testLocalTailIsSteadyWhileTheLogIsWritten() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("busy-\(UUID()).log")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let line = "a whole line of runner chatter, forty-nine bytes\n"
+        try String(repeating: line, count: 3000).write(to: url, atomically: true, encoding: .utf8)
+        let writer = try FileHandle(forWritingTo: url)
+        try writer.seekToEnd()
+        let stop = StopFlag()
+        let thread = Thread {
+            // Each line goes out in two writes, so the file often ends mid-line.
+            while !stop.isSet {
+                try? writer.write(contentsOf: Data(line.prefix(20).utf8))
+                try? writer.write(contentsOf: Data(line.dropFirst(20).utf8))
+            }
+            stop.finish()
+        }
+        thread.qualityOfService = .userInteractive   // the test waits on it at the end
+        thread.start()
+        defer { stop.set(); stop.waitUntilFinished() }
+        for _ in 0..<300 {
+            let result = try LogReader.localTailResult(path: url.path)
+            XCTAssertEqual(result.lines.count, 200)
+            XCTAssertTrue(result.lines.allSatisfy { $0 + "\n" == line })
+        }
+    }
+
+    /// Finding 4: holds the last run saved show at launch, before anything is read.
+    func testRestoredHoldsShowBeforeTheFirstRefresh() {
+        let earlier = now.addingTimeInterval(-2 * 3600)
+        let seen = [SeenRunner(repo: "o/r", name: "mac", labels: ["self-hosted", "x"], os: nil, lastSeen: earlier),
+                    SeenRunner(repo: "o/r", name: "other", labels: ["self-hosted", "x"], os: nil, lastSeen: earlier)]
+        let dash = StatusRules.restoredDashboard(
+            holds: ["mac": earlier, "ghost": earlier, "gone": earlier],
+            sources: [source("mac"), source("ghost"), source("idle")], repos: ["o/r"], seen: seen, now: now)
+        XCTAssertEqual(dash.overall.level, .red)
+        let rows = dash.lanes.flatMap(\.runners)
+        XCTAssertEqual(rows.map(\.name), ["mac"], "only runners with a restored hold are shown before the first read")
+        XCTAssertEqual(rows.first?.state, .holding)
+        XCTAssertEqual(rows.first?.log?.error, "still holding: last confirmed 2h 00m ago (log not read yet since launch)")
+        XCTAssertEqual(dash.unplacedHolds, ["ghost"], "a held runner no repo remembers still alarms")
+        XCTAssertFalse(dash.overall.reasons.contains { $0.contains("gone") }, "no log source names it any more")
+        XCTAssertTrue(dash.repoErrors.isEmpty)
+
+        // Nothing restored, or nothing still configured: the usual empty start.
+        XCTAssertEqual(StatusRules.restoredDashboard(holds: [:], sources: [source("mac")], repos: ["o/r"], seen: seen, now: now),
+                       Dashboard())
+        XCTAssertEqual(StatusRules.restoredDashboard(holds: ["gone": earlier], sources: [], repos: ["o/r"], seen: seen, now: now),
+                       Dashboard())
+    }
+
+    /// Finding 5: a damaged saved date can't crash the app.
+    func testDurationNeverTraps() throws {
+        XCTAssertEqual(Format.duration(1e30), Format.duration(.infinity))
+        XCTAssertEqual(Format.duration(-1e30), "0s")
+        XCTAssertEqual(Format.duration(-.infinity), "0s")
+        XCTAssertEqual(Format.duration(.nan), "0s")
+        XCTAssertEqual(Format.duration(59.9), "59s")
+        XCTAssertEqual(Format.duration(3 * 3600 + 5 * 60), "3h 05m")
+
+        // The same through the path a saved hold takes: decoded from defaults, then shown.
+        let suite = "io.github.che1195.CIDashboard.tests"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(Data(#"{"future":1e30,"past":-1e30}"#.utf8), forKey: SettingsStore.holdsKey)
+        let restored = SettingsStore.loadHolds(defaults)
+        XCTAssertEqual(restored.count, 2)
+        let sticky = StatusRules.stickyHolds([:], configured: ["future", "past"], previous: restored, now: now)
+        XCTAssertEqual(sticky.logs["future"]?.holding, true)
+        XCTAssertEqual(sticky.logs["past"]?.holding, true)
+        let dash = StatusRules.restoredDashboard(
+            holds: restored, sources: [source("future"), source("past")], repos: [], seen: [], now: now)
+        XCTAssertEqual(dash.unplacedHolds, ["future", "past"])
+    }
 }
 
 final class RecordingRunner: CommandRunning, @unchecked Sendable {
@@ -628,6 +962,38 @@ final class RecordingRunner: CommandRunning, @unchecked Sendable {
     }
 }
 
+
+/// Answers `gh` with a failure at once, and holds every `ssh` until `open()`; `log` gets the ssh call's number.
+final class GatedRunner: CommandRunning, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _sshCalls = 0
+    private var isOpen = false
+    private let log: @Sendable (Int) -> String
+
+    init(_ log: @escaping @Sendable (Int) -> String) { self.log = log }
+    var sshCalls: Int { lock.withLock { _sshCalls } }
+    func open() { lock.withLock { isOpen = true } }
+
+    func run(_ executable: String, _ arguments: [String], timeout: TimeInterval) async throws -> CommandResult {
+        guard executable == "/usr/bin/ssh" else {
+            return CommandResult(status: 1, stdout: Data(), stderr: Data("HTTP 502".utf8), timedOut: false)
+        }
+        let call = lock.withLock { _sshCalls += 1; return _sshCalls }
+        while !lock.withLock({ isOpen }) { try await Task.sleep(for: .milliseconds(5)) }
+        return CommandResult(status: 0, stdout: Data(log(call).utf8), stderr: Data(), timedOut: false)
+    }
+}
+
+/// Tells a background thread to stop, and waits until it has.
+final class StopFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stopped = false
+    private let finished = DispatchSemaphore(value: 0)
+    var isSet: Bool { lock.withLock { stopped } }
+    func set() { lock.withLock { stopped = true } }
+    func finish() { finished.signal() }
+    func waitUntilFinished() { finished.wait() }
+}
 
 /// A runner whose commands never return (until the test process ends).
 final class HangingRunner: CommandRunning {

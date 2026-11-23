@@ -38,8 +38,11 @@ struct MenuBarLabel: View {
         // `store.clock` ticks every few seconds so queue-age thresholds change the colour between refreshes.
         // (A TimelineView here sends the menu-bar host into an update loop.)
         let level = store.overall(at: store.clock).level
-        Image(nsImage: StatusIcon.image(level, refreshing: store.lastRefresh == nil))
-            .accessibilityLabel("CI status: \(StatusIcon.word(level))")
+        // Before the first refresh the dot is grey, unless there is already something to say (a hold saved by the
+        // last run): that shows at once.
+        let loading = store.lastRefresh == nil && level == .green
+        Image(nsImage: StatusIcon.image(level, refreshing: loading))
+            .accessibilityLabel("CI status: \(loading ? "loading" : StatusIcon.word(level))")
             .task {
                 // `--open-window` opens the dashboard window at launch (handy for screenshots and for a
                 // login item that should show the window).

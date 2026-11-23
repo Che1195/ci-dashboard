@@ -7,7 +7,7 @@ final class DashboardStore {
     var settings: AppSettings {
         didSet {
             guard settings != oldValue else { return }
-            SettingsStore.save(settings)
+            SettingsStore.save(settings, defaults)
             if settings.repos != oldValue.repos || settings.logSources != oldValue.logSources
                 || settings.ghPath != oldValue.ghPath {
                 settingsGeneration += 1
@@ -36,20 +36,27 @@ final class DashboardStore {
 
     private var seen: [SeenRunner]
     /// Runner name → when its log last showed a hold; kept until a clear line (see StatusRules.stickyHolds).
-    private var confirmedHolds: [String: Date] = SettingsStore.loadHolds()
+    private var confirmedHolds: [String: Date]
     /// Advances every 5 s; views that show age-based status read it so they re-evaluate between refreshes.
     private(set) var clock = Date()
     private var clockLoop: Task<Void, Never>?
     private var refreshLoop: Task<Void, Never>?
     private var discoveryLoop: Task<Void, Never>?
     private let commandRunner: CommandRunning
+    /// Where settings, remembered runners and holds are kept (a test passes its own, never the app's).
+    private let defaults: UserDefaults
 
-    init(commandRunner: CommandRunning = ProcessRunner()) {
+    init(commandRunner: CommandRunning = ProcessRunner(), defaults: UserDefaults = .standard) {
         self.commandRunner = commandRunner
-        var loaded = SettingsStore.load()
+        self.defaults = defaults
+        var loaded = SettingsStore.load(defaults)
         loaded.repos = AppSettings.uniqueRepos(loaded.repos)
         settings = loaded
-        seen = SettingsStore.loadSeen()
+        seen = SettingsStore.loadSeen(defaults)
+        confirmedHolds = SettingsStore.loadHolds(defaults)
+        // Holds the last run saved show from the first frame, not only once the first refresh has finished.
+        dashboard = StatusRules.restoredDashboard(
+            holds: confirmedHolds, sources: loaded.logSources, repos: loaded.repos, seen: seen, now: Date())
         // The unit-test host launches the app; don't poll GitHub from tests.
         if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil { startLoops() }
     }
@@ -129,13 +136,20 @@ final class DashboardStore {
         async let rate = try? ghClient?.rateLimit()
         let (snapshots, logStatus, rateCore) = await (snaps, logs, rate)
         let now = Date()
-        // Log evidence is recorded before the settings check below, so a settings edit can't discard a clear line.
-        let sticky = StatusRules.stickyHolds(
-            logStatus, configured: LogReader.uniqueSources(sources).map(\.runnerName), previous: confirmedHolds, now: now)
-        confirmedHolds = sticky.holds
-        SettingsStore.saveHolds(confirmedHolds)
-        // Settings changed while we were fetching: drop this result and fetch again.
-        guard generation == settingsGeneration else { refreshAgain = true; return }
+        let settingsCurrent = generation == settingsGeneration
+        // Log results are recorded even when the settings changed meanwhile, so an unrelated edit (adding a repo)
+        // can't discard a clear line. But only for sources that are still exactly what this refresh read: every
+        // keystroke in the log-source editor is a settings change, and a half-typed path or pattern must neither
+        // end a hold nor start one (see StatusRules.holdsAfterRefresh).
+        let sticky = StatusRules.holdsAfterRefresh(
+            logStatus, read: sources, current: settings.logSources, settingsCurrent: settingsCurrent,
+            previous: confirmedHolds, now: now)
+        if sticky.holds != confirmedHolds {
+            confirmedHolds = sticky.holds
+            SettingsStore.saveHolds(confirmedHolds, defaults)
+        }
+        // Settings changed while we were fetching: drop the rest of this result and fetch again.
+        guard settingsCurrent else { refreshAgain = true; return }
 
         let nothingLoaded = snapshots.allSatisfy { !$0.runnersOK && $0.runs.isEmpty }
         if ghClient == nil {
@@ -157,14 +171,7 @@ final class DashboardStore {
     /// Each repo's snapshot, a few repos at a time (bounding gh processes and their pipes). Without gh, every repo
     /// comes back unreadable, so nothing is judged absent or stranded.
     static func snapshots(_ repos: [String], client: GitHubClient?) async -> [RepoSnapshot] {
-        guard let client else {
-            return repos.map { repo in
-                var snap = RepoSnapshot(repo: repo)
-                snap.runnersOK = false
-                snap.runnersComplete = false
-                return snap
-            }
-        }
+        guard let client else { return repos.map(RepoSnapshot.unread) }
         return await withTaskGroup(of: (Int, RepoSnapshot).self) { group in
             var iterator = repos.enumerated().makeIterator()
             func addNext() -> Bool {
@@ -197,7 +204,7 @@ final class DashboardStore {
         seen = byKey.values
             .filter { repos.contains($0.repo.lowercased()) && now.timeIntervalSince($0.lastSeen) < StatusRules.rememberRunnersFor }
             .sorted { $0.name < $1.name }
-        SettingsStore.saveSeen(seen)
+        SettingsStore.saveSeen(seen, defaults)
     }
 
     /// Suggests owned repos with at least one self-hosted runner. Never adds them by itself.

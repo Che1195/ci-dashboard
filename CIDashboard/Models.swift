@@ -82,6 +82,14 @@ struct RepoSnapshot: Sendable {
     var runnersOK = true
     /// Every registered runner is in `runners` (not cut off by paging), so a missing one really is missing.
     var runnersComplete = true
+
+    /// A repo nothing could be read from (no `gh`, or not read yet): nothing is judged absent or stranded.
+    static func unread(_ repo: String) -> RepoSnapshot {
+        var snap = RepoSnapshot(repo: repo)
+        snap.runnersOK = false
+        snap.runnersComplete = false
+        return snap
+    }
 }
 
 struct JobInfo: Identifiable, Sendable, Equatable {

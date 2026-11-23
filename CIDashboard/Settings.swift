@@ -24,6 +24,13 @@ struct LogSource: Codable, Hashable, Identifiable, Sendable {
         holdPattern = try c.decodeIfPresent(String.self, forKey: .holdPattern) ?? Self.defaultHold
         clearPattern = try c.decodeIfPresent(String.self, forKey: .clearPattern) ?? Self.defaultClear
     }
+
+    /// True when both read the same log for the same runner and judge it by the same patterns (the row's `id`
+    /// plays no part). Log results count only for a source that is still like the one that was read.
+    func readsLike(_ other: LogSource) -> Bool {
+        runnerName == other.runnerName && host == other.host && path == other.path
+            && holdPattern == other.holdPattern && clearPattern == other.clearPattern
+    }
 }
 
 struct AppSettings: Codable, Equatable, Sendable {

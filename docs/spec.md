@@ -45,7 +45,7 @@ local file or runs `ssh <host> tail -n <N> <path>`. A unit test checks that ever
 ## Status rules
 | Runner | When |
 |---|---|
-| Holding | log source says holding (wins over everything). A hold stays until the log shows a clear line: a failed or timed-out read, or a marker scrolled out of the last 200 lines, keeps it, with a note saying when it was last confirmed. Holds are saved, so a relaunch keeps them; logs are read even when `gh` is missing or GitHub is unreachable |
+| Holding | log source says holding (wins over everything). Only whole lines are matched: a last line the writer hasn't finished (no newline yet) is left for the next read, and everything matched in a local file comes from one read of it; if the file shrinks while it is being read (truncated or rewritten), that read counts as failed. A hold stays until the log shows a clear line: a failed or timed-out read, or a marker scrolled out of the last 200 lines, keeps it, with a note saying when it was last confirmed. Editing settings can't end or start a hold by itself: a read counts only for a log source that is still exactly as it was when the read started (runner name, host, path, both patterns), any other runner's hold stays as it was, and a hold is dropped for having no log source only once no row names its runner. Holds are saved, so a relaunch keeps them and shows them at once, before the first refresh; logs are read even when `gh` is missing or GitHub is unreachable |
 | Busy | `status == online && busy` |
 | Idle | `status == online && !busy` |
 | Offline | `status == offline` |

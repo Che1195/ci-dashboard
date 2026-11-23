@@ -56,13 +56,67 @@ enum StatusRules {
             case nil:
                 guard let since = previous[name] else { continue }
                 holds[name] = since
-                let why = log?.error ?? "no hold or clear line in the latest read"
-                out[name] = LogStatus(
-                    holding: true, lastLine: log?.lastLine,
-                    error: "still holding: last confirmed \(Format.duration(now.timeIntervalSince(since))) ago (\(why))")
+                out[name] = stillHolding(
+                    since: since, now: now, why: log?.error ?? "no hold or clear line in the latest read",
+                    lastLine: log?.lastLine)
             }
         }
         return (out, holds)
+    }
+
+    private static func stillHolding(since: Date, now: Date, why: String, lastLine: String? = nil) -> LogStatus {
+        LogStatus(holding: true, lastLine: lastLine,
+                  error: "still holding: last confirmed \(Format.duration(now.timeIntervalSince(since))) ago (\(why))")
+    }
+
+    /// Runners the settings name in a log source row, whether or not the row can be read yet (no path).
+    static func namedRunners(_ sources: [LogSource]) -> Set<String> {
+        Set(sources.map(\.runnerName).filter { !$0.isEmpty })
+    }
+
+    /// Applies one refresh's log results to the confirmed holds, trusting only what the current settings back.
+    /// `read` are the log sources as they were when the refresh started; `current` are the sources now.
+    /// - A runner whose source is the same in both (see `LogSource.readsLike`) follows `stickyHolds`.
+    /// - Any other runner keeps its earlier entry untouched: a source edited while the refresh ran (a half-typed
+    ///   path or pattern) proves nothing, so it can neither end a hold nor start one. The same goes for a row that
+    ///   has a runner name but no path yet.
+    /// - A hold is dropped for having no log source only when `settingsCurrent` (no setting changed since the
+    ///   refresh started) and no row names its runner.
+    static func holdsAfterRefresh(
+        _ logs: [String: LogStatus], read: [LogSource], current: [LogSource], settingsCurrent: Bool,
+        previous: [String: Date], now: Date
+    ) -> (logs: [String: LogStatus], holds: [String: Date]) {
+        var wasRead: [String: LogSource] = [:]
+        for source in LogReader.uniqueSources(read) { wasRead[source.runnerName] = source }
+        let unchanged = LogReader.uniqueSources(current)
+            .filter { wasRead[$0.runnerName]?.readsLike($0) == true }.map(\.runnerName)
+        let judged = Set(unchanged)
+        var result = stickyHolds(logs.filter { judged.contains($0.key) }, configured: unchanged, previous: previous, now: now)
+        let named = namedRunners(current)
+        for (name, since) in previous where !judged.contains(name) {
+            if named.contains(name) {
+                result.holds[name] = since
+                result.logs[name] = stillHolding(since: since, now: now, why: "its log source changed or has no path")
+            } else if !settingsCurrent {
+                result.holds[name] = since
+            }
+        }
+        return result
+    }
+
+    /// What to show at launch, before anything has been read: the holds the last run saved, for runners a log source
+    /// row still names. Without this the app would start green while a runner it knew to be holding still is.
+    /// Repos count as not read yet, so only remembered runners with a restored hold get a row.
+    static func restoredDashboard(
+        holds: [String: Date], sources: [LogSource], repos: [String], seen: [SeenRunner], now: Date
+    ) -> Dashboard {
+        let named = namedRunners(sources)
+        var logs: [String: LogStatus] = [:]
+        for (name, since) in holds where named.contains(name) {
+            logs[name] = stillHolding(since: since, now: now, why: "log not read yet since launch")
+        }
+        guard !logs.isEmpty else { return Dashboard() }
+        return build(snapshots: repos.map(RepoSnapshot.unread), logs: logs, seen: seen, now: now)
     }
 
     static func regex(_ pattern: String) -> NSRegularExpression? {
@@ -276,7 +330,9 @@ enum StatusRules {
 
 enum Format {
     static func duration(_ seconds: TimeInterval) -> String {
-        let s = max(0, Int(seconds))
+        // Clamped before the conversion: Int(_:) traps on NaN, infinity and anything past Int's range, which a
+        // damaged saved date can produce.
+        let s = seconds.isNaN ? 0 : Int(min(max(0, seconds), 1_000_000_000))
         if s < 60 { return "\(s)s" }
         if s < 3600 { return String(format: "%dm %02ds", s / 60, s % 60) }
         return String(format: "%dh %02dm", s / 3600, (s % 3600) / 60)
