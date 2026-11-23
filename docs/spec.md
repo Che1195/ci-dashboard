@@ -45,14 +45,14 @@ local file or runs `ssh <host> tail -n <N> <path>`. A unit test checks that ever
 ## Status rules
 | Runner | When |
 |---|---|
-| Holding | log source says holding (wins over everything) |
+| Holding | log source says holding (wins over everything). A hold stays until the log shows a clear line: a failed or timed-out read, or a marker scrolled out of the last 200 lines, keeps it, with a note saying when it was last confirmed |
 | Busy | `status == online && busy` |
 | Idle | `status == online && !busy` |
 | Offline | `status == offline` |
 | Not registered | seen in the last 24 h, absent now |
 
 Overall (menu-bar icon):
-- **Red:** any runner holding, any job queued over 10 min, or a queued self-hosted job that no online runner in its
+- **Red:** any runner holding (including one whose log says holding but no runner list shows), any job queued over 10 min, or a queued self-hosted job that no online runner in its
   repo can take (a runner can take a job when it carries every label the job asks for, ignoring case). A job counts as
   self-hosted when it asks for `self-hosted` or for labels a known self-hosted runner carries.
 - **Orange:** any job queued over 3 min, or a GitHub/`gh` error on the last refresh.
@@ -61,15 +61,31 @@ Overall (menu-bar icon):
 
 ## Data (per repo, per refresh)
 - `GET /repos/{r}/actions/runners?per_page=100`
-- `GET /repos/{r}/actions/runs?status=queued&per_page=50`, `…status=in_progress…`, `…status=waiting…`
+- `GET /repos/{r}/actions/runs?status=in_progress&per_page=50`, `…status=queued…`, `…status=waiting…`,
+  `…status=pending…` (held by a concurrency group), `…status=requested…`
 - `GET /repos/{r}/actions/runs/{id}/jobs?per_page=100` for each queued or in-progress run
 Each part is fetched on its own: a failed part is named in an orange reason and the parts that loaded still show.
 Remembered runners show as *not registered* only when the runner list loaded in full. Jobs are fetched six runs at a
-time. About 5 + N calls per repo per refresh; at 30 s with one busy repo, roughly 1,000 calls/hour of the 5,000-hour limit.
+time. About 7 + N calls per repo per refresh; at 30 s with one busy repo, roughly 1,000 calls/hour of the 5,000-hour limit.
 Rate-limit remaining is shown in the footer.
 
 ## Exclusions (v1)
 Notifications, history charts, GitHub-hosted runner detail, organisation-level runners, any write action.
+
+## Accepted limits (closing audit, 2026-11-23)
+These assume the setup the app is built for: your own Macs as runner hosts, and log paths and a `gh` you chose.
+- **ssh runs your account's normal session on the log host.** A `~/.ssh/rc` file or a forced command on that host
+  runs as it would for any ssh login; a Windows host's `cmd.exe` would not honour the POSIX quoting. If the log path
+  is a named pipe, the remote `tail` can block after the local deadline kills `ssh`. Point log sources only at
+  regular log files on hosts you control.
+- **ssh sees only `HOME`, `USER`, `LOGNAME`, `SSH_AUTH_SOCK`, `TMPDIR`, `LANG` and a fixed `PATH`**, so no
+  `SendEnv` setting can pass a token on.
+- **A custom `gh` path is trusted.** The app runs whatever executable that setting names, and finding it runs on the
+  main thread; a `gh` on a stalled network drive would freeze the app. Leave it on Homebrew's `gh`.
+- **Each log source has at most one read outstanding.** A read that outlives its 9 s deadline keeps its slot until
+  it really ends; later polls report "previous log read still running" instead of starting another.
+- **Lists are not paged:** 100 runners, 50 runs per state, 100 jobs per run. A cut-off is named in an orange reason.
+- **Raw log lines show on runner rows**, so a secret a cleanup script prints could appear in a screenshot.
 
 ## Acceptance
 1. `xcodebuild` builds the app; unit tests for status rules, holding detection, lane grouping and the GET-only check pass.

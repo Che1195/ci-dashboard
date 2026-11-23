@@ -168,6 +168,8 @@ struct Dashboard: Sendable, Equatable {
     var repoErrors: [String] = []
     /// Queued jobs no online runner can take, counted by the labels they need.
     var stranded: [String: Int] = [:]
+    /// Runners whose log says they're holding but that no runner list shows.
+    var unplacedHolds: [String] = []
     var overall = OverallStatus(level: .green, reasons: [])
 }
 

@@ -465,6 +465,86 @@ final class StatusRulesTests: XCTestCase {
             XCTAssertEqual(call.arguments.first, "api")
         }
     }
+
+    // MARK: Audit 2
+
+    func testHoldStaysUntilAClearLine() {
+        let earlier = now.addingTimeInterval(-120)
+        let failed = ["mac": LogStatus(holding: nil, lastLine: nil, error: "ssh timed out")]
+        let kept = StatusRules.stickyHolds(failed, configured: ["mac"], previous: ["mac": earlier], now: now)
+        XCTAssertEqual(kept.logs["mac"]?.holding, true)
+        XCTAssertEqual(kept.holds["mac"], earlier)
+        XCTAssertTrue(kept.logs["mac"]?.error?.contains("ssh timed out") ?? false)
+
+        let quiet = ["mac": LogStatus(holding: nil, lastLine: "something else", error: nil)]
+        XCTAssertEqual(StatusRules.stickyHolds(quiet, configured: ["mac"], previous: ["mac": earlier], now: now)
+            .logs["mac"]?.holding, true, "marker scrolled out of the tail")
+
+        let cleared = ["mac": LogStatus(holding: false, lastLine: "cleanup succeeded", error: nil)]
+        let after = StatusRules.stickyHolds(cleared, configured: ["mac"], previous: ["mac": earlier], now: now)
+        XCTAssertEqual(after.logs["mac"]?.holding, false)
+        XCTAssertNil(after.holds["mac"])
+
+        let fresh = ["mac": LogStatus(holding: true, lastLine: "cleanup failed", error: nil)]
+        XCTAssertEqual(StatusRules.stickyHolds(fresh, configured: ["mac"], previous: [:], now: now).holds["mac"], now)
+        XCTAssertTrue(StatusRules.stickyHolds([:], configured: [], previous: ["gone": earlier], now: now).holds.isEmpty)
+    }
+
+    func testStaleHoldKeepsOnlineIdleRunnerRed() {
+        var snap = RepoSnapshot(repo: "o/r")
+        snap.runners = [runner("mac", "online", busy: false, labels: ["self-hosted", "x"])]
+        let failed = ["mac": LogStatus(holding: nil, lastLine: nil, error: "log read timed out")]
+        let sticky = StatusRules.stickyHolds(failed, configured: ["mac"], previous: ["mac": now.addingTimeInterval(-60)], now: now)
+        let dash = StatusRules.build(snapshots: [snap], logs: sticky.logs, seen: [], now: now)
+        XCTAssertEqual(dash.lanes.first?.runners.first?.state, .holding)
+        XCTAssertEqual(dash.overall.level, .red)
+    }
+
+    func testHoldOnRunnerNoListShowsIsStillRed() {
+        let snap = RepoSnapshot(repo: "o/r")
+        let logs = ["ghost": LogStatus(holding: true, lastLine: "cleanup failed", error: nil)]
+        let dash = StatusRules.build(snapshots: [snap], logs: logs, seen: [], now: now)
+        XCTAssertEqual(dash.unplacedHolds, ["ghost"])
+        XCTAssertEqual(dash.overall.level, .red)
+    }
+
+    func testSSHGetsAMinimalEnvironment() {
+        let inherited = ["GH_TOKEN": "secret", "HOME": "/h", "SSH_AUTH_SOCK": "/s", "AWS_SECRET_ACCESS_KEY": "k"]
+        let ssh = ProcessRunner.environment(for: "/usr/bin/ssh", inherited: inherited)
+        XCTAssertNil(ssh["GH_TOKEN"])
+        XCTAssertNil(ssh["AWS_SECRET_ACCESS_KEY"])
+        XCTAssertEqual(ssh["HOME"], "/h")
+        XCTAssertEqual(ssh["SSH_AUTH_SOCK"], "/s")
+        XCTAssertEqual(ssh["PATH"], ProcessRunner.searchPath)
+        let gh = ProcessRunner.environment(for: "/opt/homebrew/bin/gh", inherited: inherited)
+        XCTAssertEqual(gh["GH_TOKEN"], "secret", "gh keeps its own auth")
+        XCTAssertEqual(gh["GH_PROMPT_DISABLED"], "1")
+    }
+
+    func testHungLogReadHoldsOneSlot() async {
+        var source = LogSource(); source.runnerName = "slot-\(UUID())"; source.host = "h"; source.path = "/p"
+        let first = await LogReader.readWithDeadline(source, runner: HangingRunner(), deadline: 0.3)
+        XCTAssertEqual(first.error, "log read timed out")
+        let start = Date()
+        let second = await LogReader.readWithDeadline(source, runner: HangingRunner(), deadline: 0.3)
+        XCTAssertEqual(second.error, "previous log read still running")
+        XCTAssertLessThan(Date().timeIntervalSince(start), 0.2, "no new read started")
+    }
+
+    func testPendingRunsAreFetchedAndQueued() async {
+        let recorder = RecordingRunner { args in
+            let path = args.last ?? ""
+            if path.contains("/runners") { return #"{"total_count":0,"runners":[]}"# }
+            if path.contains("status=pending") { return #"{"workflow_runs":[{"id":20,"name":"Deploy","head_branch":"main","status":"pending","created_at":"2026-11-23T10:00:00Z"}]}"# }
+            if path.contains("status=") { return #"{"workflow_runs":[]}"# }
+            if path.contains("runs/20/jobs") { return #"{"jobs":[]}"# }
+            return nil
+        }
+        let snap = await GitHubClient(ghPath: "/usr/bin/gh", runner: recorder).snapshot("o/r")
+        XCTAssertTrue(recorder.calls.contains { $0.arguments.last?.contains("status=requested") ?? false })
+        let dash = StatusRules.build(snapshots: [snap], logs: [:], seen: [], now: now)
+        XCTAssertEqual(dash.queued.map(\.id), [-20])
+    }
 }
 
 final class RecordingRunner: CommandRunning, @unchecked Sendable {

@@ -17,18 +17,33 @@ struct ProcessRunner: CommandRunning {
     static let killGrace: TimeInterval = 2
     static let pipeGrace: TimeInterval = 1
 
+    /// GUI apps start with a minimal PATH; gh and ssh helpers live in these.
+    static let searchPath = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+    /// What ssh may see of the app's environment: enough to find the user's keys and agent, nothing else, so a
+    /// `SendEnv` line in the user's ssh config can't pass a GitHub token or other secret to a runner host.
+    static let sshEnvironmentNames: Set<String> = ["HOME", "USER", "LOGNAME", "SSH_AUTH_SOCK", "TMPDIR", "LANG"]
+
+    static func environment(for executable: String, inherited: [String: String]) -> [String: String] {
+        if (executable as NSString).lastPathComponent == "ssh" {
+            var env = inherited.filter { sshEnvironmentNames.contains($0.key) }
+            env["PATH"] = searchPath
+            return env
+        }
+        var env = inherited
+        env["PATH"] = searchPath
+        env["GH_PROMPT_DISABLED"] = "1"
+        env["NO_COLOR"] = "1"
+        return env
+    }
+
     func run(_ executable: String, _ arguments: [String], timeout: TimeInterval) async throws -> CommandResult {
         try await withCheckedThrowingContinuation { continuation in
             let state = RunState(continuation)
             let process = Process()
             process.executableURL = URL(fileURLWithPath: executable)
             process.arguments = arguments
-            var env = ProcessInfo.processInfo.environment
-            // GUI apps start with a minimal PATH; gh and ssh helpers live in these.
-            env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-            env["GH_PROMPT_DISABLED"] = "1"
-            env["NO_COLOR"] = "1"
-            process.environment = env
+            process.environment = Self.environment(for: executable, inherited: ProcessInfo.processInfo.environment)
             let out = Pipe(), err = Pipe()
             process.standardOutput = out
             process.standardError = err

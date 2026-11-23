@@ -95,9 +95,13 @@ struct GitHubClient: Sendable {
         var errors: [String] = []
 
         async let runnerList = attempt { try await self.get("repos/\(repo)/actions/runners?per_page=100", as: APIRunnerList.self) }
+        // In progress first, so a run seen in two lists mid-transition counts as started.
+        async let inProgress = attempt { try await self.runs(repo, status: "in_progress") }
         async let queued = attempt { try await self.runs(repo, status: "queued") }
         async let waiting = attempt { try await self.runs(repo, status: "waiting") }
-        async let inProgress = attempt { try await self.runs(repo, status: "in_progress") }
+        // Pending: held behind a concurrency group. Requested: created, not yet queued.
+        async let pending = attempt { try await self.runs(repo, status: "pending") }
+        async let requested = attempt { try await self.runs(repo, status: "requested") }
 
         switch await runnerList {
         case .success(let list):
@@ -112,7 +116,8 @@ struct GitHubClient: Sendable {
 
         var allRuns: [APIRun] = []
         var seen = Set<Int>()
-        for (label, result) in [("queued", await queued), ("waiting", await waiting), ("in progress", await inProgress)] {
+        for (label, result) in [("in progress", await inProgress), ("queued", await queued), ("waiting", await waiting),
+                               ("pending", await pending), ("requested", await requested)] {
             switch result {
             case .success(let list):
                 allRuns += list.workflow_runs.filter { seen.insert($0.id).inserted }

@@ -44,12 +44,28 @@ enum LogReader {
         }
     }
 
+    /// Reads still running, keyed by source. A read the deadline gave up on keeps its slot until it really ends, so a
+    /// hung source never has more than one read outstanding however many refreshes pass.
+    static let inFlight = InFlightSet()
+
+    static func inFlightKey(_ source: LogSource) -> String {
+        [source.runnerName, source.host, source.path].joined(separator: "\u{0}")
+    }
+
     /// Races the read against the deadline without waiting for a read that never returns.
     static func readWithDeadline(_ source: LogSource, runner: CommandRunning,
                                  deadline: TimeInterval = readDeadline) async -> LogStatus {
-        await withCheckedContinuation { continuation in
+        let key = inFlightKey(source)
+        guard inFlight.insert(key) else {
+            return LogStatus(holding: nil, lastLine: nil, error: "previous log read still running")
+        }
+        return await withCheckedContinuation { continuation in
             let once = ResumeOnce(continuation)
-            Task.detached { once.resume(await read(source, runner: runner)) }
+            Task.detached {
+                let status = await read(source, runner: runner)
+                inFlight.remove(key)
+                once.resume(status)
+            }
             DispatchQueue.global().asyncAfter(deadline: .now() + deadline) {
                 once.resume(LogStatus(holding: nil, lastLine: nil, error: "log read timed out"))
             }
@@ -141,6 +157,14 @@ enum LogReader {
         }
         return TailResult(lines: Array(physical.suffix(lineCount)), complete: complete)
     }
+}
+
+/// A locked set of keys; `insert` returns false when the key is already there.
+final class InFlightSet: @unchecked Sendable {
+    private let lock = NSLock()
+    private var keys = Set<String>()
+    func insert(_ key: String) -> Bool { lock.withLock { keys.insert(key).inserted } }
+    func remove(_ key: String) { _ = lock.withLock { keys.remove(key) } }
 }
 
 /// Resumes a continuation once; later calls are ignored.

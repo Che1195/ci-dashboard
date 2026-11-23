@@ -40,6 +40,31 @@ enum StatusRules {
         return nil
     }
 
+    /// A confirmed hold stays until the log shows a clear line. A read that fails, times out, or no longer contains
+    /// either marker keeps the runner holding, with a note saying when the hold was last confirmed.
+    /// `previous` and the returned `holds` map runner names to when each hold was last seen in the log; holds for
+    /// runners that are no longer configured are dropped.
+    static func stickyHolds(_ logs: [String: LogStatus], configured: [String], previous: [String: Date], now: Date)
+        -> (logs: [String: LogStatus], holds: [String: Date]) {
+        var out = logs
+        var holds: [String: Date] = [:]
+        for name in configured {
+            let log = logs[name]
+            switch log?.holding {
+            case true?: holds[name] = now
+            case false?: break
+            case nil:
+                guard let since = previous[name] else { continue }
+                holds[name] = since
+                let why = log?.error ?? "no hold or clear line in the latest read"
+                out[name] = LogStatus(
+                    holding: true, lastLine: log?.lastLine,
+                    error: "still holding: last confirmed \(Format.duration(now.timeIntervalSince(since))) ago (\(why))")
+            }
+        }
+        return (out, holds)
+    }
+
     static func regex(_ pattern: String) -> NSRegularExpression? {
         guard !pattern.isEmpty else { return nil }
         return try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
@@ -108,7 +133,7 @@ enum StatusRules {
                     if run.status == "in_progress" { running.append(placeholder) } else { queued.append(placeholder) }
                     continue
                 }
-                if jobs.isEmpty, run.status == "queued" || run.status == "waiting" {
+                if jobs.isEmpty, ["queued", "waiting", "pending", "requested"].contains(run.status) {
                     // A run GitHub hasn't created jobs for yet.
                     queued.append(JobInfo(
                         id: -run.id, repo: snap.repo, workflow: run.name ?? "Workflow",
@@ -198,6 +223,10 @@ enum StatusRules {
             }
         }
 
+        // A runner whose log says it's holding but that no repo lists (deregistered, or GitHub unreadable) still alarms.
+        let shown = Set(dash.lanes.flatMap { $0.runners.map(\.name) })
+        dash.unplacedHolds = logs.filter { $0.value.holding == true && !shown.contains($0.key) }.keys.sorted()
+
         dash.running.sort { ($0.startedAt ?? $0.createdAt) < ($1.startedAt ?? $1.createdAt) }
         dash.queued.sort { $0.createdAt < $1.createdAt }
         dash.overall = overall(dash, now: now)
@@ -216,6 +245,9 @@ enum StatusRules {
             for r in lane.runners where r.state == .holding {
                 raise(.red, "\(r.name) is holding after a failed cleanup")
             }
+        }
+        for name in dash.unplacedHolds {
+            raise(.red, "\(name) is holding after a failed cleanup (not in any runner list)")
         }
         for (needs, count) in dash.stranded.sorted(by: { $0.key < $1.key }) {
             raise(.red, "\(count) queued for \(needs), no runner online that can take \(count == 1 ? "it" : "them")")

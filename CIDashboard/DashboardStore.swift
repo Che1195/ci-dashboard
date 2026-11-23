@@ -35,6 +35,8 @@ final class DashboardStore {
     private(set) var lastDiscovery: Date?
 
     private var seen: [SeenRunner]
+    /// Runner name → when its log last showed a hold; kept until a clear line (see StatusRules.stickyHolds).
+    private var confirmedHolds: [String: Date] = [:]
     /// Advances every 5 s; views that show age-based status read it so they re-evaluate between refreshes.
     private(set) var clock = Date()
     private var clockLoop: Task<Void, Never>?
@@ -160,7 +162,10 @@ final class DashboardStore {
             globalError = nil
         }
         updateSeen(snapshots, now: now)
-        dashboard = StatusRules.build(snapshots: snapshots, logs: logStatus, seen: seen, now: now)
+        let sticky = StatusRules.stickyHolds(
+            logStatus, configured: LogReader.uniqueSources(sources).map(\.runnerName), previous: confirmedHolds, now: now)
+        confirmedHolds = sticky.holds
+        dashboard = StatusRules.build(snapshots: snapshots, logs: sticky.logs, seen: seen, now: now)
         rateLimit = rateCore
         lastRefresh = now
     }
